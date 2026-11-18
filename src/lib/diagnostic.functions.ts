@@ -45,14 +45,6 @@ function mistakeTypeFor(subjectSlug: string | undefined): string {
   }
 }
 
-function masteryToStatus(score: number): string {
-  if (score === 0) return "not_started";
-  if (score <= 49) return "weak";
-  if (score <= 69) return "learning";
-  if (score <= 84) return "stable";
-  return "mastered";
-}
-
 // ---------------- Catalog ----------------
 
 export const listAvailableDiagnostics = createServerFn({ method: "POST" })
@@ -225,7 +217,8 @@ const completeSchema = z.object({
         student_answer: z.string().nullable(),
       }),
     )
-    .min(1),
+    .min(1)
+    .max(500),
 });
 
 export const completeDiagnosticSession = createServerFn({ method: "POST" })
@@ -287,25 +280,18 @@ export const completeDiagnosticSession = createServerFn({ method: "POST" })
       checked_by: string;
       mistake_type: string | null;
       mistake_description: string | null;
+      answer_key_snapshot: unknown;
     };
     const answerRows: AnswerRow[] = [];
-    const perTopic = new Map<
-      string,
-      { score: number; max: number; correct: number; wrong: number }
-    >();
-    const mistakeRows: any[] = [];
-
-    let totalScore = 0;
-    let totalMax = 0;
-
+    if (new Set(data.answers.map((a) => a.task_id)).size !== data.answers.length) {
+      throw new Error("Повторяющееся задание в диагностике.");
+    }
     for (const ans of data.answers) {
       const task = tasksMap.get(ans.task_id);
-      if (!task) continue;
+      if (!task) throw new Error("Задание не входит в диагностику.");
       const maxP = Number(task.max_points ?? 1);
       const isCorrect = checkAnswer(task, ans.student_answer);
       const points = isCorrect === true ? maxP : 0;
-      totalScore += points;
-      totalMax += maxP;
 
       answerRows.push({
         diagnostic_session_id: data.session_id,
@@ -317,149 +303,17 @@ export const completeDiagnosticSession = createServerFn({ method: "POST" })
         checked_by: "auto",
         mistake_type: isCorrect === false ? baseMistake : null,
         mistake_description: isCorrect === false ? "Неправильный ответ в диагностике" : null,
+        answer_key_snapshot: task.correct_answer ?? null,
       });
-
-      const tid = task.topic_id as string | null;
-      if (tid) {
-        const e = perTopic.get(tid) ?? { score: 0, max: 0, correct: 0, wrong: 0 };
-        e.max += maxP;
-        e.score += points;
-        if (isCorrect === true) e.correct += 1;
-        else if (isCorrect === false) e.wrong += 1;
-        perTopic.set(tid, e);
-      }
-
-      if (isCorrect === false && tid) {
-        mistakeRows.push({
-          student_profile_id: profileId,
-          subject_id: session.subject_id,
-          topic_id: tid,
-          task_id: ans.task_id,
-          mistake_type: baseMistake,
-          mistake_description: "Ошибка во входной диагностике",
-          source: "diagnostic",
-        });
-      }
     }
 
-    const scorePercent = totalMax > 0 ? Math.round((totalScore / totalMax) * 100) : 0;
-
-    // Persist answers (upsert by session+task)
-    if (answerRows.length > 0) {
-      const { error: aErr } = await (supabaseAdmin as any)
-        .from("diagnostic_answers")
-        .upsert(answerRows, { onConflict: "diagnostic_session_id,task_id" });
-      if (aErr) throw aErr;
-    }
-
-    // Topic results
-    const topicResultRows = Array.from(perTopic.entries()).map(([topic_id, v]) => ({
-      diagnostic_session_id: data.session_id,
-      student_profile_id: profileId,
-      subject_id: session.subject_id,
-      topic_id,
-      score: v.score,
-      max_score: v.max,
-      score_percent: v.max > 0 ? Math.round((v.score / v.max) * 100) : 0,
-      correct_count: v.correct,
-      wrong_count: v.wrong,
-      detected_weaknesses: v.wrong > 0 ? "Есть ошибки в теме" : null,
-    }));
-
-    if (topicResultRows.length > 0) {
-      const { error: trErr } = await sb
-        .from("diagnostic_topic_results")
-        .upsert(topicResultRows, { onConflict: "diagnostic_session_id,topic_id" });
-      if (trErr) throw trErr;
-    }
-
-    // Update student_topic_progress per topic
-    if (topicResultRows.length > 0) {
-      const topicIds = topicResultRows.map((r) => r.topic_id);
-      const { data: existing } = await sb
-        .from("student_topic_progress")
-        .select("id, topic_id, mastery_score, practice_score, attempts_count, mistakes_count")
-        .eq("student_profile_id", profileId)
-        .in("topic_id", topicIds);
-      const existingMap = new Map<string, any>(
-        (existing ?? []).map((r: any) => [r.topic_id, r]),
-      );
-
-      const upserts = topicResultRows.map((tr) => {
-        const ex = existingMap.get(tr.topic_id);
-        const diag = tr.score_percent;
-        const practice = ex?.practice_score ?? null;
-        const newMastery =
-          practice != null
-            ? Math.round(diag * 0.7 + practice * 0.3)
-            : diag;
-        const newWrong = perTopic.get(tr.topic_id)?.wrong ?? 0;
-        return {
-          ...(ex?.id ? { id: ex.id } : {}),
-          student_profile_id: profileId,
-          subject_id: session.subject_id,
-          topic_id: tr.topic_id,
-          program_id: session.program_id,
-          diagnostic_score: diag,
-          mastery_score: newMastery,
-          status: masteryToStatus(newMastery),
-          attempts_count: (ex?.attempts_count ?? 0) + 1,
-          mistakes_count: (ex?.mistakes_count ?? 0) + newWrong,
-          last_activity_at: new Date().toISOString(),
-        };
-      });
-
-      const { error: pErr } = await sb
-        .from("student_topic_progress")
-        .upsert(upserts, { onConflict: "student_profile_id,topic_id" });
-      if (pErr) throw pErr;
-
-      // Log progress history per topic where mastery changed
-      const historyRows = upserts
-        .map((u) => {
-          const ex = existingMap.get(u.topic_id);
-          const oldScore = ex?.mastery_score ?? 0;
-          if (oldScore === u.mastery_score) return null;
-          return {
-            student_profile_id: profileId,
-            user_id: context.userId,
-            subject_id: session.subject_id,
-            topic_id: u.topic_id,
-            old_score: oldScore,
-            new_score: u.mastery_score,
-            source: "diagnostic" as const,
-            source_ref_id: session.id,
-          };
-        })
-        .filter((r) => r != null);
-      if (historyRows.length > 0) {
-        await sb.from("student_progress_history").insert(historyRows as any);
-      }
-    }
-
-
-    // Mistakes
-    if (mistakeRows.length > 0) {
-      const { error: mErr } = await sb.from("student_mistakes").insert(mistakeRows);
-      if (mErr) throw mErr;
-    }
-
-    // Close the session
-    const summary = `Диагностика завершена: ${totalScore} из ${totalMax} (${scorePercent}%).`;
-    const { data: closed, error: cErr } = await (supabaseAdmin as any)
-      .from("diagnostic_sessions")
-      .update({
-        status: "completed",
-        completed_at: new Date().toISOString(),
-        score: totalScore,
-        max_score: totalMax,
-        score_percent: scorePercent,
-        summary,
-      })
-      .eq("id", data.session_id)
-      .select("id, score, max_score, score_percent, summary, status")
-      .single();
+    // All derived progress, results, mistakes and session state commit under
+    // one server-only transaction. No client-supplied score is accepted.
+    const { data: closed, error: cErr } = await (supabaseAdmin as any).rpc("complete_diagnostic_atomic", {
+      p_session_id: data.session_id, p_user_id: context.userId, p_answers: answerRows,
+    });
     if (cErr) throw cErr;
+    if (!closed) throw new Error("Не удалось завершить диагностику.");
 
     // Final aggregates with topic titles
     const { data: topicResults } = await sb

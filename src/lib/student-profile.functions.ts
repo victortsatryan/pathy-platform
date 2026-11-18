@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { RELEASE_PROGRAM_IDS, RELEASE_SUBJECT_IDS } from "@/lib/release-scope";
 
 // ---------- Complete onboarding (atomic) ----------
@@ -123,16 +124,11 @@ export const completeStudentOnboarding = createServerFn({ method: "POST" })
         topicIds = (topics ?? []).map((t: any) => t.id);
       }
       if (topicIds.length > 0) {
-        const rows = topicIds.map((tid) => ({
-          student_profile_id: profile!.id,
-          subject_id: s.subject_id,
-          topic_id: tid,
-          program_id: s.program_id ?? null,
-          mastery_score: 0,
-        }));
-        await sb
-          .from("student_topic_progress")
-          .upsert(rows, { onConflict: "student_profile_id,topic_id" });
+        const { error } = await (supabaseAdmin as any).rpc("seed_student_progress", {
+          p_user_id: context.userId, p_profile_id: profile!.id,
+          p_subject_id: s.subject_id, p_program_id: s.program_id ?? null, p_topic_ids: topicIds,
+        });
+        if (error) throw error;
       }
     }
 
@@ -353,16 +349,11 @@ export const addStudentSubject = createServerFn({ method: "POST" })
     }
 
     if (topicIds.length > 0) {
-      const rows = topicIds.map((tid) => ({
-        student_profile_id: profile!.id,
-        subject_id: data.subject_id,
-        topic_id: tid,
-        program_id: data.program_id ?? null,
-        mastery_score: 0,
-      }));
-      await sb
-        .from("student_topic_progress")
-        .upsert(rows, { onConflict: "student_profile_id,topic_id" });
+      const { error: seedError } = await (supabaseAdmin as any).rpc("seed_student_progress", {
+        p_user_id: context.userId, p_profile_id: profile!.id,
+        p_subject_id: data.subject_id, p_program_id: data.program_id ?? null, p_topic_ids: topicIds,
+      });
+      if (seedError) throw seedError;
     }
     return ss;
   });
