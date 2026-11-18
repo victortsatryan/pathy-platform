@@ -308,16 +308,17 @@ export const submitLessonTaskAttempt = createServerFn({ method: "POST" })
     if (data.student_answer.trim() === "") throw new Error("Введите ответ");
 
     // An answer is final: repeated submits (double click, navigation) return the stored result.
-    const { data: existing } = await sb
+    const { data: existing, error: existingError } = await (supabaseAdmin as any)
       .from("task_attempts")
-      .select("id, is_correct")
+      .select("id, is_correct, correct_answer")
       .eq("user_id", context.userId)
       .eq("lesson_id", data.lesson_id)
       .eq("task_id", data.task_id)
       .eq("validated_by_server", true)
       .maybeSingle();
+    if (existingError) throw new Error(existingError.message);
     if (existing?.id) {
-      return { is_correct: !!existing.is_correct, already_submitted: true };
+      return { is_correct: !!existing.is_correct, correct_answer: existing.correct_answer, already_submitted: true };
     }
 
     if (lessonRes.data.status === "completed") throw new Error("Занятие уже завершено.");
@@ -353,7 +354,24 @@ export const submitLessonTaskAttempt = createServerFn({ method: "POST" })
     const ins = await (supabaseAdmin as any)
       .from("task_attempts")
       .insert({ ...row, validated_by_server: true, checked_by: "pathy-server-v1" });
-    if (ins.error) throw new Error(ins.error.message);
+    if (ins.error) {
+      // A concurrent request can insert after the initial read. The partial
+      // unique index identifies the winning submission, whose result must be
+      // returned unchanged, even when the retry supplied a different answer.
+      if (ins.error.code === "23505") {
+        const { data: winner, error: winnerError } = await (supabaseAdmin as any)
+          .from("task_attempts")
+          .select("is_correct, correct_answer")
+          .eq("user_id", context.userId)
+          .eq("lesson_id", data.lesson_id)
+          .eq("task_id", data.task_id)
+          .eq("validated_by_server", true)
+          .maybeSingle();
+        if (winnerError) throw new Error(winnerError.message);
+        if (winner) return { is_correct: !!winner.is_correct, correct_answer: winner.correct_answer, already_submitted: true };
+      }
+      throw new Error(ins.error.message);
+    }
 
     return { is_correct: isCorrect, correct_answer: taskRes.data.correct_answer, already_submitted: false };
   });
