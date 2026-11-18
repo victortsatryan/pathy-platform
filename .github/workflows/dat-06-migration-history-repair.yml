@@ -1,10 +1,6 @@
 name: DAT-06 repair migration history
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/dat-06-migration-history-repair.yml
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
