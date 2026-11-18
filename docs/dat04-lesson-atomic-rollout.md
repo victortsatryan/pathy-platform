@@ -18,6 +18,14 @@ administrator investigation; the migration does not delete, recalculate or
 automatically adopt these historical rows. Unverified historical attempts are
 preserved and cannot satisfy a required task. A new trusted attempt is separate.
 
+The existing owner RLS policies and grants still permit an authenticated
+learner to directly modify their own `student_topic_progress` row. This change
+prevents duplicate increments from the completion workflow; it does not make
+that table tamper-proof. Tightening those grants requires adapting and testing
+the existing diagnostic and profile initialization paths, which currently
+write through the authenticated client. Do not treat this PR as proof that all
+progress counters are protected from direct API writes.
+
 Run local tests without production credentials:
 
 ```sh
