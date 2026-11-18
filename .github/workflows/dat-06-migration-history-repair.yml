@@ -49,9 +49,9 @@ jobs:
             20261118060054
           )
           if [[ -n "$SUPABASE_DB_URL" ]]; then
-            supabase migration repair --remote="$SUPABASE_DB_URL" --status applied --yes "${versions[@]}"
+            supabase migration repair "${versions[@]}" --status applied --yes --remote="$SUPABASE_DB_URL"
             supabase migration list --remote="$SUPABASE_DB_URL"
           else
-            supabase migration repair --remote=kxqjfdbmhrotgmtzjdir --password="$SUPABASE_DB_PASSWORD" --status applied --yes "${versions[@]}"
+            supabase migration repair "${versions[@]}" --status applied --yes --password="$SUPABASE_DB_PASSWORD" --remote=kxqjfdbmhrotgmtzjdir
             supabase migration list --remote=kxqjfdbmhrotgmtzjdir --password="$SUPABASE_DB_PASSWORD"
           fi
