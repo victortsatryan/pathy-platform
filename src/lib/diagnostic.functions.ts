@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { RELEASE_SUBJECT_IDS } from "@/lib/release-scope";
 import { isAnswerCorrect } from "@/lib/answer-check";
 
@@ -155,7 +156,7 @@ export const startDiagnosticSession = createServerFn({ method: "POST" })
 
     let sessionId = open?.id as string | undefined;
     if (!sessionId) {
-      const { data: created, error: cErr } = await sb
+      const { data: created, error: cErr } = await (supabaseAdmin as any)
         .from("diagnostic_sessions")
         .insert({
           user_id: context.userId,
@@ -258,10 +259,11 @@ export const completeDiagnosticSession = createServerFn({ method: "POST" })
     const baseMistake = mistakeTypeFor(subjectSlug);
 
     // Load test tasks (for points) and task details
-    const { data: testTasks } = await sb
+    const { data: testTasks, error: testTasksError } = await (supabaseAdmin as any)
       .from("diagnostic_test_tasks")
       .select("task_id, points, task:tasks(id, topic_id, correct_answer, answer_type, exam_task_number)")
       .eq("diagnostic_test_id", session.diagnostic_test_id);
+    if (testTasksError) throw testTasksError;
 
     const tasksMap = new Map<string, any>();
     for (const tt of (testTasks ?? []) as any[]) {
@@ -344,7 +346,7 @@ export const completeDiagnosticSession = createServerFn({ method: "POST" })
 
     // Persist answers (upsert by session+task)
     if (answerRows.length > 0) {
-      const { error: aErr } = await sb
+      const { error: aErr } = await (supabaseAdmin as any)
         .from("diagnostic_answers")
         .upsert(answerRows, { onConflict: "diagnostic_session_id,task_id" });
       if (aErr) throw aErr;
@@ -444,7 +446,7 @@ export const completeDiagnosticSession = createServerFn({ method: "POST" })
 
     // Close the session
     const summary = `Диагностика завершена: ${totalScore} из ${totalMax} (${scorePercent}%).`;
-    const { data: closed, error: cErr } = await sb
+    const { data: closed, error: cErr } = await (supabaseAdmin as any)
       .from("diagnostic_sessions")
       .update({
         status: "completed",
@@ -486,6 +488,9 @@ export const getDiagnosticResults = createServerFn({ method: "POST" })
       .eq("user_id", context.userId)
       .single();
     if (error) throw error;
+    if (session.status !== "completed") {
+      throw new Error("Результаты появятся после завершения диагностики.");
+    }
 
     const { data: topicResults } = await sb
       .from("diagnostic_topic_results")
@@ -493,28 +498,41 @@ export const getDiagnosticResults = createServerFn({ method: "POST" })
       .eq("diagnostic_session_id", data.session_id)
       .order("score_percent");
 
-    const { data: answers } = await sb
+    const { data: answers, error: answersError } = await sb
       .from("diagnostic_answers")
-      .select(
-        "task_id, student_answer, is_correct, mistake_type, points_awarded, max_points, task:tasks(prompt, exam_task_number, correct_answer, topic:topics(id, title))",
-      )
+      .select("task_id, student_answer, is_correct, mistake_type, points_awarded, max_points")
       .eq("diagnostic_session_id", data.session_id);
+    if (answersError) throw answersError;
+
+    const answerTaskIds = [...new Set((answers ?? []).map((answer: any) => answer.task_id as string))];
+    const { data: tasks, error: tasksError } = answerTaskIds.length > 0
+      ? await (supabaseAdmin as any)
+          .from("tasks")
+          .select("id, prompt, exam_task_number, correct_answer, topics(id, title)")
+          .in("id", answerTaskIds)
+      : { data: [], error: null };
+    if (tasksError) throw tasksError;
+    const tasksById = new Map<string, any>((tasks ?? []).map((task: any) => [task.id, task]));
 
     const taskResults = ((answers ?? []) as any[])
-      .map((a) => ({
+      .map((a) => {
+        const task = tasksById.get(a.task_id);
+        return {
         task_id: a.task_id as string,
-        exam_task_number: (a.task?.exam_task_number ?? null) as number | null,
-        prompt: (a.task?.prompt ?? "") as string,
-        topic_title: (a.task?.topic?.title ?? null) as string | null,
+        exam_task_number: (task?.exam_task_number ?? null) as number | null,
+        prompt: (task?.prompt ?? "") as string,
+        topic_title: (task?.topics?.title ?? null) as string | null,
         student_answer: (a.student_answer ?? null) as string | null,
         correct_answer:
-          typeof a.task?.correct_answer === "string"
-            ? (a.task.correct_answer as string)
-            : a.task?.correct_answer != null
-              ? JSON.stringify(a.task.correct_answer)
-              : null,
+          typeof a.student_answer === "string" && a.student_answer.trim() !== ""
+            ? typeof task?.correct_answer === "string"
+              ? (task.correct_answer as string)
+              : task?.correct_answer != null
+                ? JSON.stringify(task.correct_answer)
+                : null
+            : null,
         is_correct: (a.is_correct ?? null) as boolean | null,
-      }))
+      }})
       .sort((x, y) => (x.exam_task_number ?? 999) - (y.exam_task_number ?? 999));
 
     const strongNumbers = taskResults

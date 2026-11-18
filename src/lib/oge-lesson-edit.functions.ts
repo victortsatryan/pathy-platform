@@ -1,6 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { canSearchTaskBank, readIsAdmin } from "@/lib/access-control";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 
 const searchSchema = z.object({
@@ -11,7 +13,12 @@ const searchSchema = z.object({
 
 export const searchTaskBank = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => searchSchema.parse(input))
-  .handler(async ({ data }) => {
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ data, context }) => {
+    if (!canSearchTaskBank(await readIsAdmin(context.supabase, context.userId))) {
+      throw new Error("Forbidden");
+    }
+
     let query = supabaseAdmin
       .from("tasks")
       .select("id, prompt, explanation, correct_answer, exam_section, difficulty, subjects(name), topics(title)")

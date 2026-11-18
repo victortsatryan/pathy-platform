@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { canReadMaterial, readIsAdmin } from "@/lib/access-control";
 import { getLinkedMaterialIds, materialTopicOrFilter } from "@/lib/extractor/topic-linking";
 
 const listSchema = z.object({
@@ -138,10 +139,24 @@ export const getMaterialDetail = createServerFn({ method: "POST" })
     const { data: row, error } = await context.supabase
       .from("materials")
       .select(
-        "id, title, description, material_type, content_text, source_name, source_url, video_url, file_url, image_url, difficulty, estimated_time_minutes, topic_id, subject_id, subjects(name), topics:topics!materials_topic_id_fkey(title)",
+        "id, title, description, material_type, content_text, source_name, source_url, video_url, file_url, image_url, difficulty, estimated_time_minutes, topic_id, subject_id, created_by, status, is_public, subjects(name), topics:topics!materials_topic_id_fkey(title)",
       )
       .eq("id", data.material_id)
       .maybeSingle();
     if (error) throw new Error(error.message);
-    return { material: row ?? null };
+    if (!row) return { material: null };
+    const isAdmin =
+      row.created_by !== context.userId && !(row.status === "published" && row.is_public)
+        ? await readIsAdmin(context.supabase, context.userId)
+        : false;
+    if (!canReadMaterial({
+      viewerId: context.userId,
+      createdBy: row.created_by,
+      status: row.status,
+      isPublic: row.is_public,
+      isAdmin,
+    })) return { material: null };
+
+    const { created_by: _createdBy, status: _status, is_public: _isPublic, ...material } = row;
+    return { material };
   });

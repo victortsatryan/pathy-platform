@@ -408,9 +408,9 @@ function TaskStep({
             >
               {attempt.is_correct ? "верно" : `неверно · правильный ответ: ${fmtAnswer(attempt.correct_answer)}`}
             </p>
-            {!attempt.is_correct && task.explanation && (
+            {!attempt.is_correct && attempt.explanation && (
               <p className="text-[14px] leading-relaxed mt-3" style={{ color: "var(--pf-muted)" }}>
-                {task.explanation}
+                {attempt.explanation}
               </p>
             )}
           </div>

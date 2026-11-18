@@ -22,7 +22,16 @@ export const Route = createFileRoute("/_authenticated/lesson/$lessonId")({
       throw notFound();
     }
 
-    return detail;
+    return {
+      ...detail,
+      practiceTasks: detail.practiceTasks.map(({ id, prompt, sourceLabel }) => ({
+        id,
+        prompt,
+        sourceLabel,
+        expectedAnswer: "",
+        explanation: "",
+      })),
+    };
   },
   staleTime: 30_000,
   errorComponent: LessonError,

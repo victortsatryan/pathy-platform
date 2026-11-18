@@ -14,9 +14,21 @@ export function normalizeAnswer(value: unknown): string {
 }
 
 /** true / false, or null when the answer is empty or there is no key. */
-export function isAnswerCorrect(correct: unknown, studentAnswer: string | null): boolean | null {
-  if (studentAnswer == null || studentAnswer.trim() === "") return null;
+export function isAnswerCorrect(
+  correct: unknown,
+  studentAnswer: string | string[] | null,
+): boolean | null {
+  if (
+    studentAnswer == null ||
+    (typeof studentAnswer === "string" && studentAnswer.trim() === "") ||
+    (Array.isArray(studentAnswer) && studentAnswer.length === 0)
+  ) return null;
   if (correct == null) return null;
+  if (Array.isArray(studentAnswer)) {
+    const given = studentAnswer.map(normalizeAnswer).sort();
+    const expected = (Array.isArray(correct) ? correct : [correct]).map(normalizeAnswer).sort();
+    return given.length === expected.length && given.every((answer, index) => answer === expected[index]);
+  }
   const given = normalizeAnswer(studentAnswer);
   if (Array.isArray(correct)) return correct.map(normalizeAnswer).includes(given);
   if (typeof correct === "object") return normalizeAnswer(JSON.stringify(correct)) === given;

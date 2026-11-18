@@ -3093,6 +3093,7 @@ export type Database = {
           topic_id: string | null
           updated_at: string
           user_id: string
+          validated_by_server: boolean
         }
         Insert: {
           checked_by?: string
@@ -3119,6 +3120,7 @@ export type Database = {
           topic_id?: string | null
           updated_at?: string
           user_id: string
+          validated_by_server?: boolean
         }
         Update: {
           checked_by?: string
@@ -3145,6 +3147,7 @@ export type Database = {
           topic_id?: string | null
           updated_at?: string
           user_id?: string
+          validated_by_server?: boolean
         }
         Relationships: [
           {

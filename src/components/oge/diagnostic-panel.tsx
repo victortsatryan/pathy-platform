@@ -20,6 +20,19 @@ type AnalysisResult = Awaited<ReturnType<typeof analyzeDiagnosticResult>>;
 
 const SUBJECT_DURATION_SECONDS = 30 * 60;
 
+type DiagnosticGrade = {
+  scorePercent: number;
+  correctCount: number;
+  weakTopics: string[];
+  topicStats: Array<{ topic: string; correct: number; total: number; percent: number }>;
+  evaluatedTasks: Array<{
+    taskId: string;
+    isCorrect: boolean;
+    correctAnswer: string | string[];
+    comment: string | null;
+  }>;
+};
+
 type SubjectInfo = { id: string; name: string; slug: string };
 
 type SubjectState = {
@@ -29,38 +42,8 @@ type SubjectState = {
   started: boolean;
   submitted: boolean;
   remaining: number;
-  result: ReturnType<typeof evaluate> | null;
+  result: DiagnosticGrade | null;
 };
-
-function evaluate(tasks: DiagnosticTaskRow[], answers: Record<string, string | string[]>) {
-  const evaluated = tasks.map((t) => {
-    const ans = answers[t.id];
-    const userNorm = Array.isArray(ans)
-      ? [...ans].map((s) => s.trim().toLowerCase()).sort().join("|")
-      : (typeof ans === "string" ? ans.trim().toLowerCase() : "");
-    const correctNorm = Array.isArray(t.correctAnswer)
-      ? [...t.correctAnswer].map((s) => s.trim().toLowerCase()).sort().join("|")
-      : t.correctAnswer.trim().toLowerCase();
-    return { task: t, isCorrect: userNorm === correctNorm };
-  });
-  const correctCount = evaluated.filter((e) => e.isCorrect).length;
-  const scorePercent = Math.round((correctCount / Math.max(evaluated.length, 1)) * 100);
-  const topicMap = new Map<string, { topic: string; total: number; correct: number }>();
-  for (const e of evaluated) {
-    const key = e.task.topicTitle ?? "Без темы";
-    const cur = topicMap.get(key) ?? { topic: key, total: 0, correct: 0 };
-    cur.total += 1;
-    if (e.isCorrect) cur.correct += 1;
-    topicMap.set(key, cur);
-  }
-  const topicStats = [...topicMap.values()].map((s) => ({
-    ...s,
-    percent: Math.round((s.correct / Math.max(s.total, 1)) * 100),
-  }));
-  const weakTopics = topicStats.filter((s) => s.percent < 70).map((s) => s.topic);
-  const strongTopics = topicStats.filter((s) => s.percent >= 80).map((s) => s.topic);
-  return { evaluated, correctCount, scorePercent, topicStats, weakTopics, strongTopics };
-}
 
 function fmtTime(sec: number) {
   return `${String(Math.floor(sec / 60)).padStart(2, "0")}:${String(sec % 60).padStart(2, "0")}`;
@@ -189,48 +172,37 @@ export function DiagnosticPanel({ planItems }: Props) {
     }));
   }
 
-  // Build enriched answer payload for saving
-  function buildAnswersPayload(state: SubjectState, result: ReturnType<typeof evaluate>) {
-    return state.tasks.map((t, idx) => {
-      const ev = result.evaluated.find((e) => e.task.id === t.id);
-      const userAns = state.answers[t.id];
-      return {
-        taskId: t.id,
-        taskNumber: idx + 1,
-        isCorrect: !!ev?.isCorrect,
-        topicTitle: t.topicTitle ?? null,
-        prompt: t.prompt,
-        answerType: t.answerType,
-        userAnswer: Array.isArray(userAns) ? userAns : (typeof userAns === "string" ? userAns : ""),
-        correctAnswer: t.correctAnswer,
-      };
-    });
-  }
-
   async function persistSession(
     subjectId: string,
     state: SubjectState,
-    result: ReturnType<typeof evaluate>,
     autoSubmitted: boolean,
-  ) {
-    if (state.tasks.length === 0) return;
-    try {
-      await saveDiagnosticSession({
-        data: {
-          subjectId,
-          scorePercent: result.scorePercent,
-          score: result.correctCount,
-          maxScore: state.tasks.length,
-          weakTopics: result.weakTopics,
-          strongTopics: result.strongTopics,
-          autoSubmitted,
-          answers: buildAnswersPayload(state, result),
-        },
-      });
-      await refreshHistory();
-    } catch (e) {
-      console.error("persistSession failed", e);
-    }
+  ): Promise<DiagnosticGrade> {
+    if (state.tasks.length === 0) throw new Error("В диагностике нет заданий.");
+    const response = await saveDiagnosticSession({
+      data: {
+        subjectId,
+        autoSubmitted,
+        answers: state.tasks.map((task) => ({
+          taskId: task.id,
+          studentAnswer: state.answers[task.id] ?? "",
+        })),
+      },
+    });
+    if (!response.ok || !response.result) throw new Error(response.error ?? "Не удалось сохранить диагностику.");
+    const result = response.result as DiagnosticGrade;
+    setStateBySubject((prev) => ({
+      ...prev,
+      [subjectId]: {
+        ...(prev[subjectId] ?? state),
+        started: false,
+        submitted: true,
+        loading: false,
+        remaining: autoSubmitted ? 0 : state.remaining,
+        result,
+      },
+    }));
+    await refreshHistory();
+    return result;
   }
 
   // Timer — auto-submit on 0 and persist
@@ -243,10 +215,15 @@ export function DiagnosticPanel({ planItems }: Props) {
         if (!cur || !cur.started || cur.submitted) return prev;
         const next = cur.remaining - 1;
         if (next <= 0) {
-          const result = evaluate(cur.tasks, cur.answers);
-          const finished: SubjectState = { ...cur, started: false, submitted: true, remaining: 0, result };
+          const finished: SubjectState = { ...cur, started: false, submitted: true, loading: true, remaining: 0 };
           queueMicrotask(() => {
-            void persistSession(activeSubjectId, finished, result, true);
+            void persistSession(activeSubjectId, finished, true).catch((error) => {
+              console.error("automatic diagnostic submission failed", error);
+              setStateBySubject((current) => ({
+                ...current,
+                [activeSubjectId]: { ...finished, submitted: false, started: true, loading: false },
+              }));
+            });
           });
           return { ...prev, [activeSubjectId]: finished };
         }
@@ -277,10 +254,13 @@ export function DiagnosticPanel({ planItems }: Props) {
 
   async function handleSubmit() {
     if (!activeSubject) return;
-    const result = evaluate(activeState.tasks, activeState.answers);
-    const finished: SubjectState = { ...activeState, started: false, submitted: true, result };
-    updateState({ started: false, submitted: true, result });
-    await persistSession(activeSubject.id, finished, result, false);
+    updateState({ loading: true });
+    try {
+      await persistSession(activeSubject.id, activeState, false);
+    } catch (error) {
+      console.error("persistSession failed", error);
+      updateState({ loading: false });
+    }
   }
 
   function answerSingle(taskId: string, value: string) {
@@ -436,7 +416,7 @@ export function DiagnosticPanel({ planItems }: Props) {
             ) : null}
             {activeState.tasks.map((task, index) => {
               const value = activeState.answers[task.id];
-              const evaluated = activeState.result?.evaluated.find((e) => e.task.id === task.id);
+              const evaluated = activeState.result?.evaluatedTasks.find((e) => e.taskId === task.id);
               return (
                 <article key={task.id} className="diagnostic-task-card">
                   <div className="diagnostic-task-card__head">
@@ -514,10 +494,10 @@ export function DiagnosticPanel({ planItems }: Props) {
                           {evaluated.isCorrect ? "Верно" : "Нужно повторить"}
                         </span>
                         <span className="list-row__meta">
-                          Правильный ответ: {Array.isArray(task.correctAnswer) ? task.correctAnswer.join(", ") : task.correctAnswer}
+                          Правильный ответ: {Array.isArray(evaluated.correctAnswer) ? evaluated.correctAnswer.join(", ") : evaluated.correctAnswer}
                         </span>
                       </div>
-                      {task.explanation ? <p className="status-line">{task.explanation}</p> : null}
+                      {evaluated.comment ? <p className="status-line">{evaluated.comment}</p> : null}
                     </div>
                   ) : null}
                 </article>

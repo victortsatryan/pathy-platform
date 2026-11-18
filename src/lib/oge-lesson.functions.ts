@@ -1,9 +1,10 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { generateLessonAiFeedback } from "@/lib/oge-ai.functions";
 import { getLessonDetail } from "@/lib/oge-mvp-data";
-import { loadMvpState } from "@/lib/oge-mvp.functions";
+import { loadMvpStateForUser } from "@/lib/oge-mvp-state.server";
 
 export const answerValueSchema = z
   .string()
@@ -17,9 +18,10 @@ export const lessonSubmissionSchema = z.object({
 });
 
 export const checkLessonAnswers = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(lessonSubmissionSchema)
-  .handler(async ({ data }) => {
-    const state = await loadMvpState();
+  .handler(async ({ data, context }) => {
+    const state = await loadMvpStateForUser(context.userId, true);
     const detail = getLessonDetail(state, data.lessonId);
 
     if (!detail) {
