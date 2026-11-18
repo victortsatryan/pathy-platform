@@ -56,8 +56,7 @@ function LessonPage() {
     queryKey: ["lesson", lessonId],
     queryFn: async () => {
       const initial = await fetchDetail({ data: { lesson_id: lessonId } });
-      // Existing planned lessons pick up newly topic-linked materials when opened.
-      // Never change completed or other users' lessons; rebuild is idempotent.
+      // Initialize an empty lesson once; existing assignments remain unchanged.
       if (initial.viewer_is_owner && initial.lesson?.learning_path_item_id &&
           !["completed", "rescheduled"].includes(initial.lesson.status)) {
         await buildLesson({ data: { path_item_id: initial.lesson.learning_path_item_id } });

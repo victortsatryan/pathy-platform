@@ -61,3 +61,17 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
 assert all(x.returncode==0 for x in rs),[x.stderr for x in rs]
 assert must('SELECT attempts_count,mistakes_count FROM student_topic_progress').strip()=='8|2'
 print('concurrent diagnostic and lesson on same topic: both increments preserved')
+# A completed lesson cannot be rebuilt even when opening races completion.
+must(f"INSERT INTO tasks(id,subject_id,topic_id,task_key,prompt) VALUES('{task(8)}','{s}','{topic}','{task(8)}','test'); INSERT INTO lessons(id,user_id,student_profile_id,subject_id,topic_id,lesson_date,title,status) VALUES('{lesson(8)}','{u}','{pr}','{s}','{topic}','2026-11-18','lesson','planned'); INSERT INTO lesson_tasks(lesson_id,task_id,user_id,order_index,points) VALUES('{lesson(8)}','{task(8)}','{u}',7,3); {attempt(8)}")
+holder=subprocess.Popen(p+[f"BEGIN; {complete(8)}; SELECT pg_sleep(1); COMMIT;"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+time.sleep(.2); start=time.monotonic()
+reopen=q(f"SET ROLE service_role; SELECT initialize_lesson_assignments('{lesson(8)}','{u}',ARRAY[]::uuid[],ARRAY['{task(6)}'::uuid])")
+elapsed=time.monotonic()-start; out,err=holder.communicate()
+assert not holder.returncode and not reopen.returncode and elapsed>.5,(err,reopen.stderr,elapsed)
+assert must(f"SELECT status,(SELECT count(*) FROM lesson_tasks WHERE lesson_id='{lesson(8)}'),(SELECT order_index FROM lesson_tasks WHERE lesson_id='{lesson(8)}'),(SELECT score FROM lesson_results WHERE lesson_id='{lesson(8)}') FROM lessons WHERE id='{lesson(8)}'").strip()=='completed|1|7|1'
+print('open racing completion: waits for lock, preserves completed assignments and result')
+must(f"INSERT INTO lessons(id,user_id,student_profile_id,subject_id,topic_id,lesson_date,title,status) VALUES('{lesson(9)}','{u}','{pr}','{s}','{topic}','2026-11-18','lesson','planned')")
+init=lambda tid:f"SET ROLE service_role; SELECT initialize_lesson_assignments('{lesson(9)}','{u}',ARRAY[]::uuid[],ARRAY['{tid}'::uuid])"
+must(init(task(8))); must(init(task(6)))
+assert must(f"SELECT task_id FROM lesson_tasks WHERE lesson_id='{lesson(9)}'").strip()==task(8)
+print('empty lesson initializes once; later candidates cannot replace assignments')

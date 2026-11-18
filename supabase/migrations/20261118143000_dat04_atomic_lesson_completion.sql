@@ -1,8 +1,4 @@
--- Rollout contract: install this migration first. Old servers fail on their
--- first lesson_results write, before they can alter progress; new servers
--- require the RPC and never fall back to the old multi-request sequence.
-REVOKE INSERT, UPDATE, DELETE ON public.lesson_results FROM service_role;
-
+-- Expansion: trusted completion functions and coordination triggers.
 CREATE OR REPLACE FUNCTION public.lock_verified_lesson_attempt()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
 DECLARE l public.lessons%ROWTYPE;

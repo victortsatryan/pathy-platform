@@ -14,7 +14,7 @@ import {
 } from "../src/lib/lesson-security";
 
 const securityMigration = readFileSync(
-  new URL("../supabase/migrations/20261118131500_dat04_f05_f06_secure_lesson_attempts.sql", import.meta.url),
+  new URL("../supabase/migrations/20261118150500_dat04_f05_f06_contract.sql", import.meta.url),
   "utf8",
 );
 

@@ -60,7 +60,7 @@ INSERT INTO public.lesson_tasks(lesson_id,task_id,user_id) VALUES('${lesson}','$
 await db.exec(migration);
 await db.exec(`SET ROLE authenticated; SET request.jwt.claim.sub='${uid}'`);
 await assert.rejects(db.query(`SELECT public.complete_lesson_atomic('${lesson}','${uid}')`),/permission denied/);
-await db.exec('RESET ROLE; SET ROLE service_role');
+await db.exec('RESET ROLE; REVOKE INSERT, UPDATE, DELETE ON public.lesson_results FROM service_role; SET ROLE service_role');
 await assert.rejects(db.query(`SELECT public.complete_lesson_atomic('${lesson}','${other}')`),/Forbidden/);
 await assert.rejects(db.query(`SELECT public.complete_lesson_atomic('${lesson}','${uid}')`),/Ответьте/);
 await assert.rejects(db.query(`INSERT INTO public.lesson_results(lesson_id,student_profile_id,user_id) VALUES('${lesson}','${profile}','${uid}')`),/permission denied/);

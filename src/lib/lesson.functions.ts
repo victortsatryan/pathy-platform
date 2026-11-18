@@ -26,11 +26,13 @@ export const buildLessonFromPathItem = createServerFn({ method: "POST" })
     // Check if a lesson already exists for this item
     const existing = await sb
       .from("lessons")
-      .select("id")
+      .select("id, status")
       .eq("learning_path_item_id", data.path_item_id)
       .eq("user_id", context.userId)
       .maybeSingle();
+    if (existing.error) throw new Error(existing.error.message);
     let lessonId = existing.data?.id as string | undefined;
+    if (lessonId && existing.data?.status === "completed") return { lesson_id: lessonId };
 
     if (!lessonId) {
       const ins = await sb
@@ -107,20 +109,6 @@ export const buildLessonFromPathItem = createServerFn({ method: "POST" })
     }
 
 
-    if (picked.length > 0) {
-      const rows = picked.map((m: any, i: number) => ({
-        lesson_id: lessonId!,
-        material_id: m.id,
-        order_index: i,
-        is_required: i === 0,
-        user_id: context.userId,
-      }));
-      const materialsUpsert = await (supabaseAdmin as any)
-        .from("lesson_materials")
-        .upsert(rows, { onConflict: "lesson_id,material_id" });
-      if (materialsUpsert.error) throw new Error(materialsUpsert.error.message);
-    }
-
     // ---- Interactive tasks (auto-checked) ----
     const taskCount = mastery < 30 ? 4 : mastery < 70 ? 6 : 4;
     const { data: tasks } = item.topic_id
@@ -132,22 +120,18 @@ export const buildLessonFromPathItem = createServerFn({ method: "POST" })
           .limit(taskCount)
       : { data: [] as { id: string }[] };
 
-    if ((tasks ?? []).length > 0) {
-      const rows = tasks!.map((t: any, i: number) => ({
-        lesson_id: lessonId!,
-        task_id: t.id,
-        order_index: i,
-        points: 1,
-        is_required: true,
-        user_id: context.userId,
-      }));
-      const tasksUpsert = await (supabaseAdmin as any)
-        .from("lesson_tasks")
-        .upsert(rows, { onConflict: "lesson_id,task_id" });
-      if (tasksUpsert.error) throw new Error(tasksUpsert.error.message);
-    }
+    // The RPC locks the lesson against completion and initializes only an
+    // untouched lesson. Existing assignments and history are never rewritten.
+    const { data: initialized, error: initError } = await (supabaseAdmin as any)
+      .rpc("initialize_lesson_assignments", {
+        p_lesson_id: lessonId, p_user_id: context.userId,
+        p_material_ids: [...new Set(picked.map((m) => m.id))],
+        p_task_ids: [...new Set((tasks ?? []).map((t: { id: string }) => t.id))],
+      });
+    if (initError) throw new Error(initError.message);
+    if (!initialized) throw new Error("Не удалось открыть занятие.");
+    return initialized;
 
-    return { lesson_id: lessonId, materials: picked.length, tasks: tasks?.length ?? 0 };
   });
 
 export const getLessonDetail = createServerFn({ method: "POST" })

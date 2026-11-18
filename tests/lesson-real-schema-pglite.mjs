@@ -12,8 +12,10 @@ const teachers=read('20260614080420_6c228cef-74f9-48be-b9d9-8ecdbb7fc364.sql');
 const teacherProfilePolicy=read('20260821082317_6ca1cfb5-6ea8-4b35-a5a3-5782c5266cdc.sql');
 const teacherProgressPolicies=read('20260821083258_987706e4-75d1-4641-a087-46e75ff4a31c.sql');
 const teacherLessons=readFileSync(new URL('../drizzle/migrations/0000_teacher_lesson_read_and_safe_pcs_import.sql',import.meta.url),'utf8');
-const security=read('20261118131500_dat04_f05_f06_secure_lesson_attempts.sql');
+const expansion=read('20261118131500_dat04_f05_f06_secure_lesson_attempts.sql');
+const security=read('20261118150500_dat04_f05_f06_contract.sql');
 const atomic=read('20261118143000_dat04_atomic_lesson_completion.sql');
+const initialize=read('20261118144500_dat04_initialize_lesson_assignments.sql');
 const progressFunctions=read('20261118150000_dat04_secure_progress_functions.sql');
 const progressGrants=read('20261118151000_dat04_protect_progress_writes.sql');
 const diagnostic=read('20260612134933_859e88cc-f627-4d51-9228-293017638b54.sql');
@@ -65,8 +67,8 @@ await db.exec(statement(progressStatus,/CREATE OR REPLACE FUNCTION public\.stp_c
 for (const [src,name] of [[profile,'stp_set_updated_at'],[progressStatus,'stp_status_auto'],[lesson,'lesson_results_set_updated_at'],[lesson,'lpi_set_updated_at'],[lesson,'calendar_events_set_updated_at']]) {
   await db.exec(statement(src,new RegExp(`CREATE TRIGGER ${name}[\\s\\S]*?;`,'i')));
 }
-await db.exec(statement(security,/ALTER TABLE public\.task_attempts\s+ADD COLUMN IF NOT EXISTS validated_by_server[\s\S]*?;/i));
-await db.exec(statement(security,/CREATE UNIQUE INDEX IF NOT EXISTS task_attempts_one_lesson_task_per_user[\s\S]*?;/i));
+await db.exec(statement(expansion,/ALTER TABLE public\.task_attempts\s+ADD COLUMN IF NOT EXISTS validated_by_server[\s\S]*?;/i));
+await db.exec(statement(expansion,/CREATE UNIQUE INDEX IF NOT EXISTS task_attempts_one_lesson_task_per_user[\s\S]*?;/i));
 for(const t of ['student_profiles','lessons','task_attempts','lesson_tasks','lesson_materials','lesson_results','calendar_events','student_topic_progress','student_mistakes','student_progress_history','learning_path_items']) await db.exec(`ALTER TABLE public.${t} ENABLE ROW LEVEL SECURITY`);
 for(const [src,name] of [[profile,'student_profiles_select_own'],[profile,'student_profiles_insert_own'],[profile,'student_profiles_update_own'],[profile,'student_profiles_delete_own'],[profile,'stp_select_own'],[profile,'stp_insert_own'],[profile,'stp_update_own'],[profile,'stp_delete_own'],[profile,'mistakes_select_own'],[profile,'mistakes_insert_own'],[profile,'mistakes_update_own'],[profile,'mistakes_delete_own'],[history,'Students view own progress history'],[history,'Students insert own progress history'],[lesson,'lpi owner all'],[lesson,'ce owner all'],[initial,'Users can view their own lessons'],[initial,'Users can create their own lessons'],[initial,'Users can view their own task attempts'],[security,'lt owner read'],[security,'lm owner read'],[security,'lr owner read']]) await db.exec(policy(src,name));
 await db.exec(statement(teachers,/CREATE OR REPLACE FUNCTION public\.is_teacher_of_student\([\s\S]*?\$\$;/i));
@@ -87,6 +89,8 @@ for (const name of ['lessons','task_attempts','lesson_tasks','lesson_materials',
 await db.exec(statement(security,/ALTER TABLE public\.lessons ALTER COLUMN status SET DEFAULT 'planned';/i));
 await db.exec(statement(security,/GRANT INSERT\s*\([^)]*\) ON TABLE public\.lessons TO authenticated;/i));
 await db.exec(atomic);
+await db.exec(initialize);
+await db.exec('REVOKE INSERT, UPDATE, DELETE ON public.lesson_results FROM service_role');
 await db.exec(progressFunctions);
 capturingSchema=false;
 if (process.env.PATHY_TEST_SCHEMA_DUMP) writeFileSync(process.env.PATHY_TEST_SCHEMA_DUMP,[...schemaStatements,progressGrants].join(';\n'));
@@ -96,6 +100,7 @@ await db.exec('SET ROLE service_role');
 await db.query(`INSERT INTO public.task_attempts(user_id,lesson_id,subject_id,student_profile_id,task_key,task_id,validated_by_server,is_correct,points_awarded,max_points) VALUES($1,$2,$3,$5,$4::uuid::text,$4::uuid,true,true,1,1)`,[u,l,sub,t,sp]);
 await db.exec(`RESET ROLE; SET ROLE authenticated; SET request.jwt.claim.sub='${u}'`);
 await assert.rejects(db.query('SELECT correct_answer FROM public.task_attempts'),/permission denied/);
+await assert.rejects(db.query('SELECT public.initialize_lesson_assignments($1,$2,ARRAY[]::uuid[],ARRAY[]::uuid[])',[l,u]),/permission denied/);
 assert.equal((await db.query('SELECT task_id FROM public.task_attempts')).rows.length,1);
 await db.exec('RESET ROLE; SET ROLE service_role');
 const a=await db.query(`SELECT public.complete_lesson_atomic($1,$2) AS value`,[l,u]);
@@ -103,6 +108,8 @@ assert.equal(a.rows[0].value.percent,100);
 assert.equal((await db.query('SELECT attempts_count FROM public.student_topic_progress')).rows[0].attempts_count,1);
 assert.equal((await db.query(`SELECT public.complete_lesson_atomic($1,$2) AS value`,[l,u])).rows[0].value.already_completed,true);
 await assert.rejects(db.query(`SELECT public.complete_lesson_atomic($1,$2)`,[l,teacher]),/Forbidden/);
+await assert.rejects(db.query(`SELECT public.initialize_lesson_assignments($1,$2,ARRAY[]::uuid[],ARRAY[]::uuid[])`,[l,teacher]),/Forbidden/);
+assert.deepEqual((await db.query(`SELECT public.initialize_lesson_assignments($1,$2,ARRAY[]::uuid[],ARRAY[$3::uuid]) AS value`,[l,u,t])).rows[0].value,{lesson_id:l,materials:0,tasks:1});
 // Existing owner UPDATE grants are independent of the lesson RPC. Record the
 // actual policy boundary without leaving a changed result in the fixture.
 await db.exec(`RESET ROLE; SET ROLE authenticated; SET request.jwt.claim.sub='${u}'; BEGIN`);
