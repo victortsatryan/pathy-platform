@@ -40,6 +40,11 @@ await db.exec(statement(lesson,/ALTER TABLE public\.lessons\s+ALTER COLUMN plan_
 await db.exec('ALTER TABLE public.lessons ALTER COLUMN slot_number DROP NOT NULL');
 await db.exec(statement(lesson,/ALTER TABLE public\.task_attempts\s+ADD COLUMN IF NOT EXISTS student_profile_id[\s\S]*?;/i));
 for (const [src,name] of [[lesson,'lesson_tasks'],[lesson,'lesson_materials'],[lesson,'lesson_results'],[lesson,'calendar_events'],[profile,'student_topic_progress'],[profile,'student_mistakes'],[history,'student_progress_history']]) await db.exec(table(src,name));
+await db.exec(statement(initial,/create or replace function public\.set_updated_at\(\)[\s\S]*?\$\$;/i));
+await db.exec(statement(profile,/CREATE OR REPLACE FUNCTION public\.stp_compute_status\(\)[\s\S]*?\$\$;/i));
+for (const [src,name] of [[profile,'stp_set_updated_at'],[profile,'stp_status_auto'],[lesson,'lesson_results_set_updated_at'],[lesson,'lpi_set_updated_at'],[lesson,'calendar_events_set_updated_at']]) {
+  await db.exec(statement(src,new RegExp(`CREATE TRIGGER ${name}[\\s\\S]*?;`,'i')));
+}
 await db.exec(statement(security,/ALTER TABLE public\.task_attempts\s+ADD COLUMN IF NOT EXISTS validated_by_server[\s\S]*?;/i));
 await db.exec(statement(security,/CREATE UNIQUE INDEX IF NOT EXISTS task_attempts_one_lesson_task_per_user[\s\S]*?;/i));
 for(const t of ['student_profiles','lessons','task_attempts','lesson_tasks','lesson_materials','lesson_results','calendar_events','student_topic_progress','student_mistakes','student_progress_history','learning_path_items']) await db.exec(`ALTER TABLE public.${t} ENABLE ROW LEVEL SECURITY`);
