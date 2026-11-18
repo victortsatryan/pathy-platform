@@ -1,0 +1,61 @@
+name: DAT-06 repair migration history
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/dat-06-migration-history-repair.yml
+permissions:
+  contents: read
+jobs:
+  repair-history-only:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install pinned Supabase CLI
+        run: |
+          npm install --global supabase@3.2.0
+          supabase --version
+      - name: Check remote connection credentials
+        shell: bash
+        run: |
+          if [[ -n "$SUPABASE_DB_URL" ]]; then
+            if [[ "$SUPABASE_DB_URL" != *".pooler.supabase.com"* ]]; then
+              echo "::error::SUPABASE_DB_URL must use the Supabase IPv4 pooler because the direct database host is unreachable from the current runner."
+              exit 1
+            fi
+            echo "Using the configured Supabase pooler URL (value hidden)."
+          elif [[ -n "$SUPABASE_ACCESS_TOKEN" && -n "$SUPABASE_DB_PASSWORD" ]]; then
+            echo "Using Supabase project reference plus configured database password."
+          else
+            echo "::error::No usable Supabase CLI credentials. Configure SUPABASE_DB_URL (IPv4 pooler), or both SUPABASE_ACCESS_TOKEN and SUPABASE_DB_PASSWORD in this repository's Actions secrets. No migration command was run."
+            exit 1
+          fi
+      - name: Repair only the migration history
+        shell: bash
+        run: |
+          versions=(
+            20261104120000
+            20261107180000
+            20261107230000
+            20261107233000
+            20261108002000
+            20261108004000
+            20261108005000
+            20261108005500
+            20261118060054
+          )
+          if [[ -n "$SUPABASE_DB_URL" ]]; then
+            supabase migration repair --remote="$SUPABASE_DB_URL" --status applied --yes "${versions[@]}"
+            supabase migration list --remote="$SUPABASE_DB_URL"
+          else
+            supabase migration repair --remote=kxqjfdbmhrotgmtzjdir --password="$SUPABASE_DB_PASSWORD" --status applied --yes "${versions[@]}"
+            supabase migration list --remote=kxqjfdbmhrotgmtzjdir --password="$SUPABASE_DB_PASSWORD"
+          fi
