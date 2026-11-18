@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import type { Database } from "../src/integrations/supabase/types";
 import { canReadLessonDetails, canReadMaterial, canSearchTaskBank, readIsAdmin } from "../src/lib/access-control";
 import { isAnswerCorrect } from "../src/lib/answer-check";
+import { completeLessonForUser } from "../src/lib/lesson-completion.server";
 import {
   getLessonAttemptsForAssignedTasks,
   getMissingRequiredTaskIds,
@@ -85,6 +86,22 @@ describe("task bank access", () => {
 });
 
 describe("lesson task membership and completion", () => {
+  it("binds completion to the authenticated identity and delegates all writes to one RPC", async () => {
+    const result = { score: 1, max: 1, percent: 100, summary: "ok", already_completed: false };
+    const rpc = vi.fn().mockResolvedValue({ data: result, error: null });
+    await expect(completeLessonForUser({ rpc }, "authenticated-user", "lesson-id")).resolves.toEqual(result);
+    expect(rpc).toHaveBeenCalledOnce();
+    expect(rpc).toHaveBeenCalledWith("complete_lesson_atomic", {
+      p_lesson_id: "lesson-id", p_user_id: "authenticated-user",
+    });
+  });
+
+  it("fails closed when the RPC is unavailable or rejects the operation", async () => {
+    const rpc = vi.fn().mockResolvedValue({ data: null, error: { message: "RPC unavailable" } });
+    await expect(completeLessonForUser({ rpc }, "user", "lesson")).rejects.toThrow("RPC unavailable");
+    expect(rpc).toHaveBeenCalledOnce();
+  });
+
   it("accepts only a task assigned to the addressed lesson", () => {
     expect(isTaskAssignedToLesson(["task-1", "task-2"], "task-2")).toBe(true);
     expect(isTaskAssignedToLesson(["task-1", "task-2"], "foreign-task")).toBe(false);
