@@ -56,8 +56,7 @@ function LessonPage() {
     queryKey: ["lesson", lessonId],
     queryFn: async () => {
       const initial = await fetchDetail({ data: { lesson_id: lessonId } });
-      // Existing planned lessons pick up newly topic-linked materials when opened.
-      // Never change completed or other users' lessons; rebuild is idempotent.
+      // Initialize an empty lesson once; existing assignments remain unchanged.
       if (initial.viewer_is_owner && initial.lesson?.learning_path_item_id &&
           !["completed", "rescheduled"].includes(initial.lesson.status)) {
         await buildLesson({ data: { path_item_id: initial.lesson.learning_path_item_id } });
@@ -408,9 +407,9 @@ function TaskStep({
             >
               {attempt.is_correct ? "верно" : `неверно · правильный ответ: ${fmtAnswer(attempt.correct_answer)}`}
             </p>
-            {!attempt.is_correct && task.explanation && (
+            {!attempt.is_correct && attempt.explanation && (
               <p className="text-[14px] leading-relaxed mt-3" style={{ color: "var(--pf-muted)" }}>
-                {task.explanation}
+                {attempt.explanation}
               </p>
             )}
           </div>

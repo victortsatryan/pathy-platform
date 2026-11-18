@@ -42,19 +42,6 @@ import { applyLocalOverridesToState } from "@/lib/oge-mvp-data";
 
 type ViewMode = "list" | "calendar" | "analytics" | "diagnostic" | "assistant";
 type CalendarMode = "period" | "week";
-type DiagnosticTaskType = "single" | "multiple" | "text";
-
-type DiagnosticTask = {
-  id: string;
-  subject: string;
-  topic: string;
-  type: DiagnosticTaskType;
-  prompt: string;
-  sourceLabel: string;
-  options?: string[];
-  correctAnswer: string | string[];
-  explanation: string;
-};
 
 type EditablePlanField = keyof Pick<PlanItem, "topic" | "dateISO" | "time" | "note">;
 
@@ -70,74 +57,6 @@ const viewTabs: Array<{
   { id: "assistant", label: "Ассистент", Icon: Sparkles },
 ];
 
-const WEEKLY_DIAGNOSTIC_DURATION_SECONDS = 60 * 60;
-
-const weeklyDiagnosticTasks: DiagnosticTask[] = [
-  {
-    id: "diag-math-1",
-    subject: "Математика",
-    topic: "Уравнения и вычисления",
-    type: "single",
-    prompt: "Решите уравнение: 3x - 9 = 12",
-    sourceLabel: "ОГЭ · математика · задание базового уровня",
-    options: ["5", "6", "7", "8"],
-    correctAnswer: "7",
-    explanation: "Сначала переносим -9 вправо: 3x = 21, затем делим обе части на 3 и получаем x = 7.",
-  },
-  {
-    id: "diag-rus-1",
-    subject: "Русский язык",
-    topic: "Пунктуация в сложном предложении",
-    type: "single",
-    prompt: "Укажите вариант, где нужна одна запятая: «Когда начался дождь ___ мы вернулись домой».",
-    sourceLabel: "ОГЭ · русский язык · пунктуационный анализ",
-    options: ["запятая не нужна", "перед словом «мы»", "после слова «мы»", "нужны две запятые"],
-    correctAnswer: "перед словом «мы»",
-    explanation: "Придаточная часть заканчивается перед главной, поэтому ставим одну запятую перед словом «мы».",
-  },
-  {
-    id: "diag-eng-1",
-    subject: "Английский язык",
-    topic: "Grammar · Present Perfect",
-    type: "text",
-    prompt: "Complete the sentence with the correct verb form: ‘She ___ already ___ her homework.’ (do)",
-    sourceLabel: "ОГЭ · English · grammar",
-    correctAnswer: "has done",
-    explanation: "Для Present Perfect with she используем has + V3, поэтому правильный ответ: has done.",
-  },
-  {
-    id: "diag-bio-1",
-    subject: "Биология",
-    topic: "Клетка и органоиды",
-    type: "multiple",
-    prompt: "Выберите органоиды, которые участвуют в синтезе и транспорте веществ в клетке.",
-    sourceLabel: "ОГЭ · биология · клетка",
-    options: ["рибосомы", "эндоплазматическая сеть", "лейкоциты", "аппарат Гольджи"],
-    correctAnswer: ["рибосомы", "эндоплазматическая сеть", "аппарат Гольджи"],
-    explanation: "Рибосомы синтезируют белок, ЭПС и аппарат Гольджи обеспечивают транспорт и модификацию веществ.",
-  },
-  {
-    id: "diag-math-2",
-    subject: "Математика",
-    topic: "Геометрия · площадь",
-    type: "text",
-    prompt: "Найдите площадь прямоугольника со сторонами 6 и 4. Запишите только число.",
-    sourceLabel: "ОГЭ · математика · геометрия",
-    correctAnswer: "24",
-    explanation: "Площадь прямоугольника равна произведению сторон: 6 × 4 = 24.",
-  },
-  {
-    id: "diag-rus-2",
-    subject: "Русский язык",
-    topic: "Орфография",
-    type: "single",
-    prompt: "Выберите слово с проверяемой безударной гласной в корне.",
-    sourceLabel: "ОГЭ · русский язык · орфография",
-    options: ["заг..реть", "т..варищ", "лесн..к", "к..саться"],
-    correctAnswer: "лесн..к",
-    explanation: "В слове «лесник» безударную гласную можно проверить словом «лес». Остальные случаи относятся к другим орфограммам.",
-  },
-];
 
 const calendarModeTabs: Array<{ id: CalendarMode; label: string }> = [
   { id: "period", label: "Весь период" },
@@ -176,104 +95,7 @@ export function OgeMvpApp({ data }: OgeMvpAppProps) {
   );
   const [selectedLessonId, setSelectedLessonId] = useState<string | null>(null);
   const [planItems, setPlanItems] = useState(initialPlanItems);
-  const [diagnosticAnswers, setDiagnosticAnswers] = useState<Record<string, string | string[]>>({});
-  const [diagnosticStarted, setDiagnosticStarted] = useState(false);
-  const [diagnosticSubmitted, setDiagnosticSubmitted] = useState(false);
-  const [diagnosticRemainingSeconds, setDiagnosticRemainingSeconds] = useState(WEEKLY_DIAGNOSTIC_DURATION_SECONDS);
   const currentFocusDay = calendarDays.find((day) => day.isCurrentFocus) ?? calendarDays[0] ?? null;
-
-  const saturdayDays = useMemo(
-    () => calendarDays.filter((day) => !day.isRestDay && day.dayShort === "Сб"),
-    [calendarDays],
-  );
-  const nextDiagnosticDay =
-    saturdayDays.find((day) => (currentFocusDay ? day.dateISO >= currentFocusDay.dateISO : day.isCurrentFocus)) ??
-    saturdayDays[0] ??
-    null;
-
-  const diagnosticTasks = useMemo(() => weeklyDiagnosticTasks, []);
-
-  const diagnosticResult = useMemo(() => {
-    if (!diagnosticSubmitted) return null;
-
-    const evaluatedTasks = diagnosticTasks.map((task) => {
-      const answer = diagnosticAnswers[task.id];
-      const normalizedUser = Array.isArray(answer)
-        ? [...answer].map((item) => item.trim().toLowerCase()).sort()
-        : typeof answer === "string"
-          ? answer.trim().toLowerCase()
-          : "";
-      const normalizedCorrect = Array.isArray(task.correctAnswer)
-        ? [...task.correctAnswer].map((item) => item.trim().toLowerCase()).sort()
-        : task.correctAnswer.trim().toLowerCase();
-      const isCorrect = Array.isArray(normalizedCorrect)
-        ? Array.isArray(normalizedUser) && normalizedUser.join("|") === normalizedCorrect.join("|")
-        : normalizedUser === normalizedCorrect;
-
-      return {
-        ...task,
-        answer,
-        isCorrect,
-      };
-    });
-
-    const correctCount = evaluatedTasks.filter((task) => task.isCorrect).length;
-    const scorePercent = Math.round((correctCount / Math.max(evaluatedTasks.length, 1)) * 100);
-    const topicStats = Array.from(
-      evaluatedTasks.reduce((map, task) => {
-        const current = map.get(task.topic) ?? { topic: task.topic, subject: task.subject, total: 0, correct: 0 };
-        current.total += 1;
-        current.correct += task.isCorrect ? 1 : 0;
-        map.set(task.topic, current);
-        return map;
-      }, new Map<string, { topic: string; subject: string; total: number; correct: number }>()).values(),
-    ).map((item) => ({
-      ...item,
-      percent: Math.round((item.correct / Math.max(item.total, 1)) * 100),
-    }));
-
-    const weakTopics = topicStats.filter((item) => item.percent < 70).sort((a, b) => a.percent - b.percent);
-
-    return {
-      evaluatedTasks,
-      scorePercent,
-      correctCount,
-      topicStats,
-      weakTopics,
-    };
-  }, [diagnosticAnswers, diagnosticSubmitted, diagnosticTasks]);
-
-  const diagnosticProgress = useMemo(() => {
-    const answered = diagnosticTasks.filter((task) => {
-      const value = diagnosticAnswers[task.id];
-      return Array.isArray(value) ? value.length > 0 : typeof value === "string" && value.trim().length > 0;
-    }).length;
-
-    return {
-      answered,
-      total: diagnosticTasks.length,
-      percent: Math.round((answered / Math.max(diagnosticTasks.length, 1)) * 100),
-    };
-  }, [diagnosticAnswers, diagnosticTasks]);
-
-  useEffect(() => {
-    if (!diagnosticStarted || diagnosticSubmitted) return;
-
-    const timer = window.setInterval(() => {
-      setDiagnosticRemainingSeconds((current) => {
-        if (current <= 1) {
-          window.clearInterval(timer);
-          setDiagnosticSubmitted(true);
-          setDiagnosticStarted(false);
-          return 0;
-        }
-
-        return current - 1;
-      });
-    }, 1000);
-
-    return () => window.clearInterval(timer);
-  }, [diagnosticStarted, diagnosticSubmitted]);
 
   const dayMetaById = useMemo(
     () => new Map(calendarDays.map((day) => [day.id, day])),
@@ -567,29 +389,6 @@ export function OgeMvpApp({ data }: OgeMvpAppProps) {
     setActiveView("calendar");
   };
 
-  const handleStartDiagnostic = () => {
-    setDiagnosticStarted(true);
-    setDiagnosticSubmitted(false);
-    setDiagnosticRemainingSeconds(WEEKLY_DIAGNOSTIC_DURATION_SECONDS);
-    setDiagnosticAnswers({});
-  };
-
-  const handleSubmitDiagnostic = () => {
-    setDiagnosticSubmitted(true);
-    setDiagnosticStarted(false);
-  };
-
-  const handleDiagnosticAnswerChange = (taskId: string, value: string) => {
-    setDiagnosticAnswers((current) => ({ ...current, [taskId]: value }));
-  };
-
-  const handleDiagnosticMultiToggle = (taskId: string, option: string) => {
-    setDiagnosticAnswers((current) => {
-      const existing = Array.isArray(current[taskId]) ? [...current[taskId]] : [];
-      const next = existing.includes(option) ? existing.filter((item) => item !== option) : [...existing, option];
-      return { ...current, [taskId]: next };
-    });
-  };
 
   const handleGenerateAiPlan = async () => {
     const subjectStats = subjectPrograms.map((subjectProgram) => {
@@ -642,10 +441,6 @@ export function OgeMvpApp({ data }: OgeMvpAppProps) {
           : activeView === "assistant"
             ? "Чат с AI-репетитором: видит ваш план и последние диагностики, помогает разобраться с темами и заданиями."
             : "Диагностика по каждому предмету: 30 минут, задания из БД по темам недели, история и внешние результаты.";
-
-  const diagnosticTimerLabel = `${String(Math.floor(diagnosticRemainingSeconds / 60)).padStart(2, "0")}:${String(
-    diagnosticRemainingSeconds % 60,
-  ).padStart(2, "0")}`;
 
   return (
     <main className="app-shell">

@@ -29,6 +29,12 @@ jobs:
         run: npm ci --legacy-peer-deps --no-audit --no-fund
       - name: Run Pathy extractor integration tests
         run: npx vitest run --config vitest.extractor.config.ts
+      - name: Check lesson security and transaction in PGlite
+        run: |
+          npx vitest run tests/security-pathy-lesson.test.ts
+          node tests/security-sql-pglite.mjs
+          node tests/atomic-lesson-pglite.mjs
+          node tests/lesson-real-schema-pglite.mjs
       - name: Generate routes with the declared TanStack CLI
         run: npx tsr generate
       - name: Typecheck all application code

@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { isAnswerCorrect } from "@/lib/answer-check";
 
 export type DiagnosticTaskRow = {
   id: string;
@@ -13,8 +14,6 @@ export type DiagnosticTaskRow = {
   prompt: string;
   answerType: "single" | "multiple" | "text";
   options: string[];
-  correctAnswer: string | string[];
-  explanation: string | null;
   difficulty: string;
 };
 
@@ -80,8 +79,6 @@ function mapTask(row: any): DiagnosticTaskRow {
     prompt: row.prompt,
     answerType: (row.answer_type ?? "single") as "single" | "multiple" | "text",
     options: Array.isArray(row.options) ? row.options.map(String) : [],
-    correctAnswer: normalizeAnswer(row.correct_answer),
-    explanation: row.explanation ?? null,
     difficulty: row.difficulty ?? "medium",
   };
 }
@@ -95,6 +92,7 @@ export const loadSubjectDiagnostic = createServerFn({ method: "POST" })
       limit: z.number().min(1).max(40).default(10),
     }),
   )
+  .middleware([requireSupabaseAuth])
   .handler(async ({ data }) => {
     const { subjectId, weeklyTopicTitles, limit } = data;
 
@@ -119,7 +117,7 @@ export const loadSubjectDiagnostic = createServerFn({ method: "POST" })
 
     let query = supabaseAdmin
       .from("tasks")
-      .select("id, subject_id, topic_id, prompt, answer_type, options, correct_answer, explanation, difficulty, subjects(name), topics(title)")
+      .select("id, subject_id, topic_id, prompt, answer_type, options, difficulty, subjects(name), topics(title)")
       .eq("subject_id", subjectId)
       .eq("is_published", true)
       .limit(limit);
@@ -146,10 +144,11 @@ export const searchTasksForSubject = createServerFn({ method: "POST" })
       excludeIds: z.array(z.string().uuid()).default([]),
     }),
   )
+  .middleware([requireSupabaseAuth])
   .handler(async ({ data }) => {
     let q = supabaseAdmin
       .from("tasks")
-      .select("id, subject_id, topic_id, prompt, answer_type, options, correct_answer, explanation, difficulty, subjects(name), topics(title)")
+      .select("id, subject_id, topic_id, prompt, answer_type, options, difficulty, subjects(name), topics(title)")
       .eq("subject_id", data.subjectId)
       .eq("is_published", true)
       .limit(20);
@@ -169,52 +168,91 @@ export const searchTasksForSubject = createServerFn({ method: "POST" })
 
 const sessionResultSchema = z.object({
   subjectId: z.string().uuid(),
-  scorePercent: z.number().min(0).max(100),
-  score: z.number().min(0),
-  maxScore: z.number().min(0),
-  weakTopics: z.array(z.string()).default([]),
-  strongTopics: z.array(z.string()).default([]),
   autoSubmitted: z.boolean().default(false),
   answers: z.array(
     z.object({
-      taskId: z.string(),
-      taskNumber: z.number().int().min(1),
-      isCorrect: z.boolean(),
-      topicTitle: z.string().nullable().optional(),
-      prompt: z.string().optional(),
-      answerType: z.string().optional(),
-      userAnswer: z.union([z.string(), z.array(z.string())]).optional(),
-      correctAnswer: z.union([z.string(), z.array(z.string())]).optional(),
+      taskId: z.string().uuid(),
+      studentAnswer: z.union([z.string(), z.array(z.string())]),
     }),
-  ),
+  ).min(1).max(40),
 });
 
 export const saveDiagnosticSession = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(sessionResultSchema)
   .handler(async ({ data, context }) => {
-    const { supabase, userId } = context;
-    const enrichedAnswers = data.answers.map((a, idx) => ({
-      ...a,
-      ...(idx === 0 ? { autoSubmitted: data.autoSubmitted } : {}),
+    const taskIds = data.answers.map((answer) => answer.taskId);
+    if (new Set(taskIds).size !== taskIds.length) throw new Error("В диагностике есть повторяющиеся задания.");
+
+    const { data: taskRows, error: taskError } = await (supabaseAdmin as any)
+      .from("tasks")
+      .select("id, subject_id, topic_id, prompt, answer_type, correct_answer, explanation, exam_task_number, topics(title)")
+      .eq("subject_id", data.subjectId)
+      .eq("is_published", true)
+      .in("id", taskIds);
+    if (taskError) throw new Error(taskError.message);
+    if ((taskRows ?? []).length !== taskIds.length) {
+      throw new Error("Одно или несколько заданий недоступны для этой диагностики.");
+    }
+
+    const tasksById = new Map<string, any>((taskRows ?? []).map((task: any) => [task.id, task]));
+    const evaluated = data.answers.map((answer, index) => {
+      const task = tasksById.get(answer.taskId);
+      const hasAttempt = Array.isArray(answer.studentAnswer)
+        ? answer.studentAnswer.some((value) => value.trim().length > 0)
+        : answer.studentAnswer.trim().length > 0;
+      return {
+        taskId: task.id,
+        taskNumber: task.exam_task_number ?? index + 1,
+        isCorrect: hasAttempt && isAnswerCorrect(task.correct_answer, answer.studentAnswer) === true,
+        topicTitle: task.topics?.title ?? null,
+        prompt: task.prompt,
+        answerType: task.answer_type ?? "single",
+        userAnswer: answer.studentAnswer,
+        correctAnswer: hasAttempt ? normalizeAnswer(task.correct_answer) : null,
+        comment: hasAttempt ? task.explanation ?? null : null,
+        ...(index === 0 ? { autoSubmitted: data.autoSubmitted } : {}),
+      };
+    });
+    const correctCount = evaluated.filter((answer) => answer.isCorrect).length;
+    const scorePercent = Math.round((correctCount / Math.max(evaluated.length, 1)) * 100);
+    const topicTallies = new Map<string, { correct: number; total: number }>();
+    for (const answer of evaluated) {
+      const topic = answer.topicTitle ?? "Без темы";
+      const tally = topicTallies.get(topic) ?? { correct: 0, total: 0 };
+      tally.total += 1;
+      tally.correct += answer.isCorrect ? 1 : 0;
+      topicTallies.set(topic, tally);
+    }
+    const topicStats = [...topicTallies.entries()].map(([topic, tally]) => ({
+      topic,
+      correct: tally.correct,
+      total: tally.total,
+      percent: Math.round((tally.correct / tally.total) * 100),
     }));
-    const { error } = await supabase.from("diagnostic_sessions").insert({
-      user_id: userId,
+    const weakTopics = topicStats.filter((topic) => topic.percent < 70).map((topic) => topic.topic);
+    const strongTopics = topicStats.filter((topic) => topic.percent >= 80).map((topic) => topic.topic);
+
+    const { error } = await (supabaseAdmin as any).from("diagnostic_sessions").insert({
+      user_id: context.userId,
       subject_id: data.subjectId,
       diagnostic_type: "weekly_subject" as any,
-      score: data.score,
-      max_score: data.maxScore,
+      score: correctCount,
+      max_score: evaluated.length,
       completed_at: new Date().toISOString(),
-      answers: enrichedAnswers as any,
-      weaknesses: data.weakTopics as any,
-      strengths: data.strongTopics as any,
+      answers: evaluated as any,
+      weaknesses: weakTopics as any,
+      strengths: strongTopics as any,
       recommendations: [] as any,
     });
     if (error) {
       console.error("saveDiagnosticSession", error);
       return { ok: false, error: error.message };
     }
-    return { ok: true };
+    return {
+      ok: true,
+      result: { scorePercent, correctCount, topicStats, weakTopics, evaluatedTasks: evaluated },
+    };
   });
 
 const externalSchema = z.object({

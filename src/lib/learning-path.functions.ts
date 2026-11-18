@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { RELEASE_SUBJECT_IDS } from "@/lib/release-scope";
 import { getLinkedMaterialIds, materialTopicOrFilter } from "@/lib/extractor/topic-linking";
 import { withUnstartedSourceTopics } from "@/lib/extractor/curriculum-routing";
@@ -104,7 +105,11 @@ async function archivePreviousPaths(sb: any, userId: string, keepPathId?: string
       .in("lesson_id", openIds)
       .neq("status", "completed");
     if (c.error) throw new Error(c.error.message);
-    const u = await sb.from("lessons").update({ status: "rescheduled" }).in("id", openIds);
+    const u = await (supabaseAdmin as any)
+      .from("lessons")
+      .update({ status: "rescheduled" })
+      .in("id", openIds)
+      .eq("user_id", userId);
     if (u.error) throw new Error(u.error.message);
   }
   const it = await sb
@@ -257,7 +262,6 @@ export const generateLearningPath = createServerFn({ method: "POST" })
         title: it.title,
         goal: `Закрыть слабую тему: ${it.title}`,
         duration_minutes: it.duration_minutes ?? 60,
-        status: "planned" as const,
       }));
       const lessonsIns = await sb
         .from("lessons")
@@ -297,7 +301,7 @@ export const generateLearningPath = createServerFn({ method: "POST" })
           ]);
           const mats = matsRes.data ?? [];
           if (mats.length > 0) {
-            await sb.from("lesson_materials").insert(
+            const materialInsert = await (supabaseAdmin as any).from("lesson_materials").insert(
               mats.map((m: any, i: number) => ({
                 lesson_id: first.id,
                 material_id: m.id,
@@ -306,10 +310,11 @@ export const generateLearningPath = createServerFn({ method: "POST" })
                 user_id: context.userId,
               })),
             );
+            if (materialInsert.error) throw new Error(materialInsert.error.message);
           }
           const tks = tasksRes.data ?? [];
           if (tks.length > 0) {
-            await sb.from("lesson_tasks").insert(
+            const taskInsert = await (supabaseAdmin as any).from("lesson_tasks").insert(
               tks.map((t: any, i: number) => ({
                 lesson_id: first.id,
                 task_id: t.id,
@@ -319,6 +324,7 @@ export const generateLearningPath = createServerFn({ method: "POST" })
                 user_id: context.userId,
               })),
             );
+            if (taskInsert.error) throw new Error(taskInsert.error.message);
           }
         }
       }
@@ -371,7 +377,6 @@ export const generateCalendarFromLearningPath = createServerFn({ method: "POST" 
         lesson_date: it.planned_date,
         title: it.title,
         duration_minutes: it.duration_minutes,
-        status: "planned" as const,
       }));
 
     let created: any[] = [];
