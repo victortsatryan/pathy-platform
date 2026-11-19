@@ -5,9 +5,10 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/integrations/supabase/types";
 import {
   IN_FLIGHT_STATUSES, MAX_SOURCE_BYTES, PUBLISH_BATCH, REPROCESS_ROOT_STATUSES, RESULT_PAGE_LIMIT, canPublishRevision,
-  canPublishWithRights, classifyUnit, effectivePublication, kindToMaterialType, magicMatches, parseResultPage,
+  canPublishWithRights, classifyUnit, effectivePublication, kindToMaterialType, parseResultPage,
   parseWorkerStatus, sourceExtension, stableUnitKey, workerCorrectionVersion,
 } from "./pipeline";
+import { verifySourceResponse } from "./source-verification.server";
 import { needsContentReview, topicBelongsToSubject } from "./topic-linking";
 import { sourceUnitQuality } from "./source-sections";
 import {
@@ -115,29 +116,42 @@ export const registerExtractorUpload = createServerFn({ method: "POST" }).middle
     const ext = sourceExtension(data.file_name);
     if (!ext) throw new Error("Неподдерживаемый тип файла");
     if (!data.storage_path.startsWith(`${data.file_sha256}/`)) throw new Error("Путь файла не соответствует SHA-256");
-    // Dedup on the root upload only: later reprocess revisions share the SHA.
-    const prior = await sb.from("extractor_jobs").select("id").eq("file_sha256", data.file_sha256).eq("revision", 1).maybeSingle();
-    if (prior.error) throw new Error(prior.error.message);
-    if (prior.data) return { id: prior.data.id, duplicate: true };
-    // No full download: check size and magic bytes only. The SHA is verified by the worker against source_sha256.
+    // Verify the actual object before deduplication or any dispatch.
     const info = await sb.storage.from(BUCKET).info(data.storage_path);
     if (info.error || !info.data) throw new Error("Загруженный файл не найден: " + (info.error?.message ?? ""));
     const size = Number(info.data.size ?? 0);
     if (!size || size > MAX_SOURCE_BYTES) throw new Error("Файл пустой или больше 160 MB");
     const signed = await sb.storage.from(BUCKET).createSignedUrl(data.storage_path, 120);
     if (signed.error) throw new Error(signed.error.message);
-    const head = await fetch(signed.data.signedUrl, { headers: { Range: "bytes=0-511" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
-    const bytes = new Uint8Array(await head.arrayBuffer()).slice(0, 512);
-    if (!magicMatches(ext, bytes)) throw new Error("Содержимое файла не соответствует расширению ." + ext);
+    const source = await fetch(signed.data.signedUrl, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    await verifySourceResponse(source, { sha256: data.file_sha256, size, extension: ext });
+    // A source identity match is not permission to replace metadata or to
+    // silently associate an existing source with another subject.
+    const existingRoot = async () => {
+      const prior = await sb.from("extractor_jobs")
+        .select("id,file_name,mime_type,size_bytes,storage_path,subject_id,author")
+        .eq("file_sha256", data.file_sha256).eq("revision", 1).maybeSingle();
+      if (prior.error) throw new Error(prior.error.message);
+      if (!prior.data) return null;
+      const p = prior.data;
+      if (p.file_name !== data.file_name || p.mime_type !== data.mime_type ||
+          p.size_bytes !== size || p.storage_path !== data.storage_path ||
+          p.subject_id !== data.subject_id || p.author !== (data.author || null)) {
+        throw new Error("Конфликт источника: существующая загрузка имеет другие метаданные; данные не изменены");
+      }
+      return p.id;
+    };
+    const priorId = await existingRoot();
+    if (priorId) return { id: priorId, duplicate: true };
     const ins = await sb.from("extractor_jobs").insert({
       file_sha256: data.file_sha256, file_name: data.file_name, mime_type: data.mime_type, size_bytes: size,
       storage_path: data.storage_path, subject_id: data.subject_id, author: data.author || null, created_by: context.userId, revision: 1,
     }).select("id").single();
     if (ins.error) {
       if (ins.error.code === "23505") {
-        const again = await sb.from("extractor_jobs").select("id").eq("file_sha256", data.file_sha256).eq("revision", 1).single();
-        if (again.error || !again.data) throw new Error("Не удалось найти повторную загрузку");
-        return { id: again.data.id, duplicate: true };
+        const again = await existingRoot();
+        if (!again) throw new Error("Не удалось найти повторную загрузку");
+        return { id: again, duplicate: true };
       }
       throw new Error(ins.error.message);
     }

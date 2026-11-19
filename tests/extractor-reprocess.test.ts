@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 // Isolated: RPC wrappers, database, storage and worker HTTP are all in memory. Not LIVE E2E.
 vi.mock("@tanstack/react-start", () => ({
@@ -217,9 +218,21 @@ describe("revision-safe upload dedup and publication guard", () => {
   it("re-upload of the same SHA returns the root revision even when revisions exist", async () => {
     const db = memoryDb(); stubWorker(goodHealth);
     await invoke(reprocessExtractorJob, db, { id: rootId });
+    const content = "%PDF-1.7\nsynthetic";
+    const sourceSha = createHash("sha256").update(content).digest("hex");
+    const sourcePath = `${sourceSha}/synthetic.pdf`;
+    Object.assign(db.tables.extractor_jobs[0], { file_sha256: sourceSha, file_name: "synthetic.pdf", size_bytes: content.length, storage_path: sourcePath });
+    db.sb.storage.from = () => ({
+      info: vi.fn(async () => ({ data: { size: content.length }, error: null })),
+      createSignedUrl: vi.fn(async () => ({ data: { signedUrl: "https://storage.invalid/source" }, error: null })),
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(content)));
     const before = db.writes();
-    const r = await invoke(registerExtractorUpload, db, { storage_path: path, file_sha256: sha, file_name: "goltsova.pdf", mime_type: "application/pdf", subject_id: null, author: null });
+    const r = await invoke(registerExtractorUpload, db, { storage_path: sourcePath, file_sha256: sourceSha, file_name: "synthetic.pdf", mime_type: "application/pdf", subject_id: subjectId, author: "Гольцова" });
     expect(r).toEqual({ id: rootId, duplicate: true });
+    await expect(invoke(registerExtractorUpload, db, { storage_path: sourcePath, file_sha256: sourceSha, file_name: "synthetic.pdf", mime_type: "application/pdf", subject_id: null, author: "Гольцова" })).rejects.toThrow("Конфликт источника");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("%PDF-1.7\nmodified!")));
+    await expect(invoke(registerExtractorUpload, db, { storage_path: sourcePath, file_sha256: sourceSha, file_name: "synthetic.pdf", mime_type: "application/pdf", subject_id: subjectId, author: "Гольцова" })).rejects.toThrow();
     expect(db.writes()).toBe(before);
   });
 
