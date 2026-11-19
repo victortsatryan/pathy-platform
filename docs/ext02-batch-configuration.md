@@ -18,6 +18,9 @@ published content, inventing curriculum links, or removing the existing forms.
 CSV preview is now read-only and counts valid rows only; it does not predict
 whether a row would be inserted or updated. This fix does not move CSV writes
 into the common intake.
+`20261119122000_community_author_status_guard.sql` independently closes direct
+author promotion and forged moderation fields while preserving existing rows
+and administrator moderation. It does not unify community publication.
 
 Before enabling, review the migrations and the deployment target, determine the
 existing GitHub Actions plan, available included minutes and spending limits,

@@ -35,6 +35,8 @@ jobs:
           node tests/security-sql-pglite.mjs
           node tests/atomic-lesson-pglite.mjs
           node tests/lesson-real-schema-pglite.mjs
+          node tests/ext02-batch-pglite.mjs
+          node tests/community-author-status-pglite.mjs
       - name: Generate routes with the declared TanStack CLI
         run: npx tsr generate
       - name: Typecheck all application code
