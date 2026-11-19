@@ -4,9 +4,9 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/integrations/supabase/types";
 import {
-  IN_FLIGHT_STATUSES, MAX_SOURCE_BYTES, PUBLISH_BATCH, REPROCESS_ROOT_STATUSES, RESULT_PAGE_LIMIT, canPublishRevision,
-  canPublishWithRights, classifyUnit, effectivePublication, kindToMaterialType, parseResultPage,
-  parseWorkerStatus, sourceExtension, stableUnitKey, workerCorrectionVersion,
+  IN_FLIGHT_STATUSES, MAX_SOURCE_BYTES, PUBLISH_BATCH, REPROCESS_ROOT_STATUSES, canPublishRevision,
+  canPublishWithRights, classifyUnit, effectivePublication, kindToMaterialType,
+  sourceExtension, stableUnitKey,
 } from "./pipeline";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { dispatchBatch } from "./actions-dispatch.server";
@@ -22,40 +22,11 @@ import {
 type Sb = SupabaseClient<Database>;
 const BUCKET = "extractor-sources";
 const TIMEOUT_MS = 20_000;
-const PAGES_PER_CALL = 8; // result pages fetched per refresh call, keeps each invocation short
 
 async function assertAdmin(sb: Sb, userId: string) {
   const { data, error } = await sb.rpc("has_role", { _user_id: userId, _role: "admin" });
   if (error) throw new Error(error.message);
   if (!data) throw new Error("Доступ только администратору");
-}
-
-/** Historical HTTP worker is excluded; old results remain readable. */
-function worker(): { url: string; token: string } | { error: string } | null {
-  return null;
-}
-
-async function call(w: { url: string; token: string }, path: string, init?: RequestInit) {
-  const res = await fetch(`${w.url}${path}`, {
-    ...init, signal: AbortSignal.timeout(TIMEOUT_MS),
-    headers: { Authorization: `Bearer ${w.token}`, ...(init?.body ? { "Content-Type": "application/json" } : {}) },
-  });
-  const body = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`Обработчик ответил ${res.status}`);
-  return body as Record<string, any>;
-}
-
-/** Server-only gate: worker configured AND GET /health reports the exact OCR correction version. Throws otherwise. */
-async function correctionWorkerVersion(): Promise<string> {
-  const w = worker();
-  if (!w) throw new Error("Обработчик не подключён — повторная обработка не создана");
-  if ("error" in w) throw new Error(w.error + " — повторная обработка не создана");
-  let health: unknown;
-  try { health = await call(w, "/health"); }
-  catch (e) { throw new Error("Не удалось проверить обработчик (" + (e instanceof Error ? e.message : "нет ответа") + ") — повторная обработка не создана"); }
-  const version = workerCorrectionVersion(health);
-  if (!version) throw new Error("На обработчике не развернута утверждённая версия OCR-корректора — повторная обработка не создана");
-  return version;
 }
 
 async function loadJob(sb: Sb, id: string) {
@@ -65,7 +36,7 @@ async function loadJob(sb: Sb, id: string) {
 }
 
 async function update(sb: Sb, id: string, patch: Database["public"]["Tables"]["extractor_jobs"]["Update"]) {
-  const r = await sb.from("extractor_jobs").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", id);
+  const r = await supabaseAdmin.from("extractor_jobs").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", id);
   if (r.error) throw new Error(r.error.message);
 }
 
@@ -75,7 +46,7 @@ async function dispatch(sb: Sb, id: string, userId: string) {
   catch (error) {
     // A dispatch timeout may still have created a run. Never undo a reserved
     // job or automatically start a second one.
-    const result = await sb.from("extractor_jobs").update({ status: "worker_not_configured", error: "Пакетная обработка ожидает настройки, проверки лимита или истечения резерва", updated_at: new Date().toISOString() }).eq("id", id).eq("status", "uploaded");
+    const result = await supabaseAdmin.from("extractor_jobs").update({ status: "worker_not_configured", error: "Пакетная обработка ожидает настройки, проверки лимита или истечения резерва", updated_at: new Date().toISOString() }).eq("id", id).eq("status", "uploaded");
     if (result.error) throw new Error(result.error.message);
     throw error;
   }
@@ -133,7 +104,7 @@ export const registerExtractorUpload = createServerFn({ method: "POST" }).middle
     };
     const priorId = await existingRoot();
     if (priorId) return { id: priorId, duplicate: true };
-    const ins = await sb.from("extractor_jobs").insert({
+    const ins = await supabaseAdmin.from("extractor_jobs").insert({
       file_sha256: data.file_sha256, file_name: data.file_name, mime_type: data.mime_type, size_bytes: size,
       storage_path: data.storage_path, subject_id: data.subject_id, author: data.author || null, created_by: context.userId, revision: 1,
     }).select("id").single();
@@ -189,7 +160,7 @@ export const reprocessExtractorJob = createServerFn({ method: "POST" }).middlewa
         throw new Error("Повторная обработка этого источника уже выполняется");
       }
       const next = Math.max(1, ...rows.map((r) => r.revision)) + 1;
-      const ins = await sb.from("extractor_jobs").insert({
+      const ins = await supabaseAdmin.from("extractor_jobs").insert({
         file_sha256: root.file_sha256, file_name: root.file_name, mime_type: root.mime_type, size_bytes: root.size_bytes,
         storage_path: root.storage_path, subject_id: root.subject_id, author: root.author, rights_basis: root.rights_basis,
         created_by: context.userId, revision: next, parent_job_id: root.id, worker_rule_version: version, status: "uploaded",
@@ -203,35 +174,6 @@ export const reprocessExtractorJob = createServerFn({ method: "POST" }).middlewa
     return { id: newId, revision: fresh.revision, status: fresh.status, error: fresh.error, worker_rule_version: version };
   });
 
-/** Pull a bounded number of result pages and persist them; resumes from result_next_offset. */
-async function pullResult(sb: Sb, w: { url: string; token: string }, job: Awaited<ReturnType<typeof loadJob>>) {
-  let offset = job.result_next_offset ?? 0;
-  let total = job.result_total_units;
-  for (let i = 0; i < PAGES_PER_CALL; i++) {
-    const page = parseResultPage(await call(w, `/v1/jobs/${encodeURIComponent(job.id)}/result?offset=${offset}&limit=${RESULT_PAGE_LIMIT}`), { sha: job.file_sha256, offset, total });
-    if (page.source_sha256 !== job.file_sha256) throw new Error("SHA-256 источника в результате не совпадает с загруженным файлом");
-    total = page.total_units ?? total;
-    if (page.units.length) {
-      const rows = page.units.map((u, k) => ({ job_id: job.id, unit_id: String(u.unit_id), position: offset + k, raw: u as Json }));
-      const ins = await sb.from("extractor_job_units").upsert(rows, { onConflict: "job_id,unit_id", ignoreDuplicates: true });
-      if (ins.error) throw new Error(ins.error.message);
-    }
-    if (page.next_offset === null) {
-      const { count, error } = await sb.from("extractor_job_units").select("id", { count: "exact", head: true }).eq("job_id", job.id);
-      if (error) throw new Error(error.message);
-      if (total === null || count !== total) {
-        return update(sb, job.id, { status: "failed", error: `Получено блоков ${count}, ожидалось ${total ?? "?"}`, result_next_offset: null });
-      }
-      if (total === 0) return update(sb, job.id, { status: "failed", error: "Обработчик вернул 0 блоков" });
-      return update(sb, job.id, { status: "succeeded", progress: 100, error: null, result_next_offset: null, result_total_units: total, result_summary: page.summary as Json });
-    }
-    if (page.next_offset <= offset) throw new Error("next_offset не продвигается");
-    offset = page.next_offset;
-  }
-  const pct = total ? Math.min(99, Math.round((offset / total) * 100)) : 0;
-  await update(sb, job.id, { status: "fetching_result", progress: pct, result_next_offset: offset, result_total_units: total });
-}
-
 export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware([requireSupabaseAuth])
   .inputValidator((v: unknown) => z.object({ id: z.string().uuid() }).parse(v))
   .handler(async ({ data, context }) => {
@@ -242,29 +184,9 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
       const expired = await (supabaseAdmin as any).rpc("ext02_expire_job", { p_job: job.id, p_user: context.userId });
       if (expired.error) throw new Error("Не удалось проверить срок обработки");
     }
-    const w = worker();
-    const ok = w && !("error" in w) ? w : null;
-    if (ok && job.external_job_id) {
-      try {
-        if (job.status === "queued" || job.status === "processing") {
-          const st = parseWorkerStatus(await call(ok, `/v1/jobs/${encodeURIComponent(job.id)}`));
-          if (st.status === "succeeded") {
-            await update(sb, job.id, { status: "fetching_result", stage: st.stage, progress: 0, result_next_offset: 0 });
-            await pullResult(sb, ok, await loadJob(sb, job.id));
-          } else {
-            await update(sb, job.id, { status: st.status, stage: st.stage, error: st.error });
-          }
-        } else if (job.status === "fetching_result") {
-          await pullResult(sb, ok, job);
-        }
-      } catch (e) {
-        console.error("extractor poll failed", e);
-        await update(sb, job.id, { error: "Не удалось получить данные обработчика: " + (e instanceof Error ? e.message : "") });
-      }
-    }
     const fresh = await loadJob(sb, data.id);
     const decisions = (fresh.unit_decisions ?? {}) as Record<string, "accept" | "reject">;
-    const rows = await sb.from("extractor_job_units").select("unit_id,raw,publish_state,reviewed_text,review_choice,reviewed_at").eq("job_id", fresh.id).order("position").limit(5000);
+    const rows = await sb.from("extractor_job_units").select("unit_id,raw,publish_state,reviewed_text,review_choice,reviewed_by,reviewed_at").eq("job_id", fresh.id).order("position").limit(5000);
     if (rows.error) throw new Error(rows.error.message);
     // Reprocess revisions must expose source before/after even when the
     // legacy extractor confidently classified the unit. They never publish
@@ -282,9 +204,9 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
     }
     const units = (rows.data ?? []).map((r) => {
       const raw = r.raw as Record<string, any>;
-      const c = classifyUnit(raw, fresh.author);
+      const c = classifyUnit(raw?.source?.intake_mode === "manual_audit" ? { ...raw, usable_for_learning: true } : raw, fresh.author);
       const machine = fresh.revision > 1 && !!raw.machine_correction && c.decision !== "private" && c.decision !== "invalid";
-      const currentDecision = machine ? "review" as const : c.decision;
+      const currentDecision = machine || (fresh.worker_rule_version === "pathy-batch-v1" && c.decision === "confident") ? "review" as const : c.decision;
       const originalText = machine && typeof raw.original_presentation_text === "string" ? raw.original_presentation_text : null;
       return { unit_id: c.unit_id, title: c.title, kind: c.kind, pages: c.pages, role: c.role,
         decision: currentDecision, reasons: machine ? [...c.reasons, "Машинная коррекция — сверить с оригиналом"] : c.reasons,
@@ -303,11 +225,11 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
         material_id: fresh.revision > 1 ? rootMaterialByUnit.get(c.unit_id) ?? null : null,
         reviewed_text: r.reviewed_text, review_choice: r.review_choice, reviewed_at: r.reviewed_at,
         admin: decisions[c.unit_id] ?? null,
-        publish: fresh.revision > 1 ? false : effectivePublication(c, r.review_choice as any, r.reviewed_text, decisions[c.unit_id]).publish,
+        publish: fresh.revision > 1 ? false : (fresh.worker_rule_version !== "pathy-batch-v1" || (!!r.reviewed_by && !!r.reviewed_at && ["keep_original", "accept_corrected"].includes(r.review_choice ?? ""))) && effectivePublication(c, r.review_choice as any, r.reviewed_text, decisions[c.unit_id]).publish,
         state: r.publish_state };
     });
     const { result: _r, ...meta } = fresh;
-    return { job: meta, units, workerConfigured: ok !== null };
+    return { job: meta, units, workerConfigured: false };
   });
 
 export const setExtractorUnitDecision = createServerFn({ method: "POST" }).middleware([requireSupabaseAuth])
@@ -341,7 +263,7 @@ export const saveExtractorUnitReview = createServerFn({ method: "POST" }).middle
     if (row.data.publish_state === "published") throw new Error("Блок уже опубликован; опубликованные материалы не изменяются");
     const text = data.reviewed_text?.trim() ? data.reviewed_text : null;
     if (data.choice === "accept_corrected" && !text) throw new Error("Пустой исправленный текст");
-    const up = await sb.from("extractor_job_units").update({
+    const up = await supabaseAdmin.from("extractor_job_units").update({
       reviewed_text: text, review_choice: data.choice, reviewed_by: context.userId, reviewed_at: new Date().toISOString(),
       ...(row.data.publish_state === "skipped" ? { publish_state: "pending" } : {}),
     }).eq("id", row.data.id);
@@ -394,9 +316,10 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
     for (const row of batch.data ?? []) {
       const raw = row.raw as Record<string, any>;
       if (raw?.source?.sha256 !== job.file_sha256) throw new Error("SHA блока не совпадает с источником обработки");
-      const u = classifyUnit(raw, job.author);
+      const reviewedAudit = raw?.source?.intake_mode === "manual_audit" && !!row.reviewed_by && !!row.reviewed_at && ["keep_original", "accept_corrected"].includes(row.review_choice ?? "");
+      const u = classifyUnit(reviewedAudit ? { ...raw, usable_for_learning: true } : raw, job.author);
       const mark = (publish_state: "published" | "existing" | "skipped" | "failed", extra: { material_id?: string; publish_error?: string } = {}) =>
-        sb.from("extractor_job_units").update({ publish_state, ...extra }).eq("id", row.id);
+        supabaseAdmin.from("extractor_job_units").update({ publish_state, ...extra }).eq("id", row.id);
       if (job.worker_rule_version === "pathy-batch-v1" && (!row.reviewed_by || !row.reviewed_at || !["keep_original", "accept_corrected"].includes(row.review_choice ?? ""))) {
         await mark("skipped"); r.skipped++; continue;
       }
@@ -414,8 +337,10 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
       }
       // The legacy book importer stored source SHA + unit_id but no unit_key.
       // Never create a second material for it, or silently adopt conflicting data.
+      const legacyId = typeof raw?.source?.legacy_unit_id === "string" ? raw.source.legacy_unit_id : u.unit_id;
+      const legacyOriginal = raw?.source?.intake_mode === "manual_audit" ? raw.source.original_audit_unit : raw;
       const legacy = await sb.from("materials").select("id,extractor_metadata,subject_id")
-        .eq("extractor_metadata->>unit_id", u.unit_id).limit(100);
+        .eq("extractor_metadata->>unit_id", legacyId).limit(100);
       if (legacy.error) throw new Error(legacy.error.message);
       if ((legacy.data ?? []).length >= 100) throw new Error("Слишком много совпадений unit_id; нужна ручная проверка");
       const sameSource = (legacy.data ?? []).filter((m) => {
@@ -426,7 +351,7 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
       if (sameSource.length === 1) {
         const existing = sameSource[0];
         const metadata = existing.extractor_metadata as Record<string, any> | null;
-        if (existing.subject_id !== data.subject_id || canonicalJson(metadata?.original_unit) !== canonicalJson(raw)) {
+        if (existing.subject_id !== data.subject_id || canonicalJson(metadata?.original_unit) !== canonicalJson(legacyOriginal)) {
           throw new Error("Конфликт ранее импортированной единицы; сохранённый материал не изменён");
         }
         await mark("existing", { material_id: existing.id }); r.existing++; continue;
@@ -474,7 +399,7 @@ export const reopenSkippedUnits = createServerFn({ method: "POST" }).middleware(
   .inputValidator((v: unknown) => z.object({ id: z.string().uuid() }).parse(v))
   .handler(async ({ data, context }) => {
     await assertAdmin(context.supabase, context.userId);
-    const r = await context.supabase.from("extractor_job_units").update({ publish_state: "pending" }).eq("job_id", data.id).in("publish_state", ["skipped", "failed"]);
+    const r = await supabaseAdmin.from("extractor_job_units").update({ publish_state: "pending" }).eq("job_id", data.id).in("publish_state", ["skipped", "failed"]);
     if (r.error) throw new Error(r.error.message);
     return { ok: true };
   });
@@ -583,7 +508,7 @@ export const publishApprovedExtractorCorrections = createServerFn({ method: "POS
         if (!updated.data) throw new Error("Материал изменился параллельно — публикация остановлена");
         applied++;
       }
-      const mark = await sb.from("extractor_job_units")
+      const mark = await supabaseAdmin.from("extractor_job_units")
         .update({ publish_state: "published", material_id: p.materialId })
         .eq("id", p.unitRowId).eq("job_id", job.id);
       if (mark.error) throw new Error(mark.error.message);

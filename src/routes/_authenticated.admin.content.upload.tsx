@@ -267,17 +267,17 @@ function JobDetail({ id, subjects, topics, defaultSubject }: { id: string; subje
           <option value="">Предмет</option>{subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
         </select>
         <select aria-label="Тема" className="h-9 max-w-xs rounded-md border bg-background px-2 text-sm" value={topic} disabled={!subject} onChange={(e) => setTopic(e.target.value)}>
-          <option value="">Без темы</option>{topics.filter((t) => t.subject_id === subject).map((t) => <option key={t.id} value={t.id}>{t.title}</option>)}
+          <option value="">{job.worker_rule_version === "pathy-batch-v1" ? "Выберите утверждённую тему" : "Без темы"}</option>{topics.filter((t) => t.subject_id === subject).map((t) => <option key={t.id} value={t.id}>{t.title}</option>)}
         </select>
         <select className="h-9 rounded-md border bg-background px-2 text-sm" value={rights} onChange={(e) => setRights(e.target.value as typeof rights)}>
           <option value="unknown">Права не подтверждены</option><option value="own">Собственный материал</option>
           <option value="licensed">Есть лицензия/разрешение</option><option value="public_domain">Общественное достояние</option>
         </select>
-        <Button disabled={!subject || rights === "unknown" || toPublish === 0 || pub.isPending} onClick={() => pub.mutate()}>
+        <Button disabled={!subject || (job.worker_rule_version === "pathy-batch-v1" && !topic) || rights === "unknown" || toPublish === 0 || pub.isPending} onClick={() => pub.mutate()}>
           {pub.isPending ? `Публикация… ${pubPct ?? ""}` : job.status === "published" ? "Дополнить публикацию" : `Опубликовать для пользователей Pathy (${toPublish})`}
         </Button>
         <span className="text-xs text-muted-foreground">Видно только вошедшим пользователям Pathy. Существующие материалы и задания не изменяются.</span>
-        <p className="w-full text-xs text-muted-foreground">Тема (необязательно) назначается только материалам, публикуемым в этой партии, и только по вашему выбору. Экзаменационные задания, ключи ответов, уроки и события календаря не создаются. Если книга охватывает несколько тем, оставьте «Без темы».</p>
+        <p className="w-full text-xs text-muted-foreground">{job.worker_rule_version === "pathy-batch-v1" ? "Для этой обработки требуется утверждённая тема." : "Тема назначается только по вашему выбору."} Экзаменационные задания и ключи ответов не создаются.</p>
       </div>}
       {job.status === "published" && <SourceTopicSections jobId={id} />}
       {job.status === "published" && <PublishedTopicLinker jobId={id} topics={topics} />}

@@ -33,3 +33,18 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex: results=list(e
 assert all(r.returncode==0 for r in results),[r.stderr for r in results]
 assert must("SELECT status,(SELECT count(*) FROM extractor_job_units) FROM extractor_jobs")=='succeeded|1'
 print('10 concurrent reservations: one; 10 run claims: one; 10 identical completions: one unit')
+# The two manual entry points share this transaction. Concurrent identical
+# imports are retries; a changed payload cannot replace history.
+manual_job='10000000-0000-0000-0000-000000000002'; other='c'*64
+must(f"INSERT INTO extractor_jobs(id,file_sha256,file_name,size_bytes,storage_path,status) VALUES('{manual_job}','{other}','b.txt',1,'{other}/b.txt','uploaded')")
+manual_unit={'unit_id':f'source:{other}:unit:legacy:one','source':{'sha256':other,'intake_mode':'manual_audit'},'role':'student_material','requires_manual_review':True,'usable_for_grading':False,'usable_for_learning':False}
+manual={'format':'pathy-extraction-result-v1','source':{'sha256':other},'summary':{'total_units':1},'pipeline_context':{'mode':'manual_audit','source_sha256':other,'source_original_bytes_verified':True,'source_block_linkage_complete':False},'units':[manual_unit]}
+body=json.dumps(manual,separators=(',',':'))
+q=f"SET ROLE service_role; SELECT ext02_import_audit_result('{manual_job}','{u}','{body}'::jsonb)"
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex: results=list(ex.map(lambda _:query(q),range(10)))
+assert all(r.returncode==0 for r in results),[r.stderr for r in results]
+assert must(f"SELECT count(*) FROM extractor_job_units WHERE job_id='{manual_job}'")=='1'
+manual['units'][0]['title']='changed'
+changed=json.dumps(manual,separators=(',',':'))
+assert query(f"SET ROLE service_role; SELECT ext02_import_audit_result('{manual_job}','{u}','{changed}'::jsonb)").returncode!=0
+print('10 concurrent identical audit imports: one unit; changed payload rejected')

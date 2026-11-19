@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+const service = vi.hoisted(() => ({ db: null as any }));
+vi.mock("@/integrations/supabase/client.server", () => ({ supabaseAdmin: new Proxy({}, { get: (_t, key) => service.db[key] }) }));
 import { createHash } from "node:crypto";
 
 // Isolated: RPC wrappers, database, storage and worker HTTP are all in memory. Not LIVE E2E.
@@ -87,7 +89,7 @@ function memoryDb(admin = true) {
 }
 
 const invoke = (fn: unknown, db: ReturnType<typeof memoryDb>, data?: Row) =>
-  (fn as (arg: unknown) => Promise<any>)({ data, context: { supabase: db.sb, userId: "admin-1" } });
+  (service.db = db.sb, (fn as (arg: unknown) => Promise<any>)({ data, context: { supabase: db.sb, userId: "admin-1" } }));
 
 type Call = { url: string; method: string; body: any; auth: string | null };
 function stubWorker(health: unknown, opts: { postStatus?: number } = {}) {

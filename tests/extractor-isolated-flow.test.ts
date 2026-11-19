@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+const service = vi.hoisted(() => ({ db: null as any }));
+vi.mock("@/integrations/supabase/client.server", () => ({ supabaseAdmin: new Proxy({}, { get: (_t, key) => service.db[key] }) }));
 
 // No production client is loaded. RPC wrappers, database and worker HTTP are isolated in memory.
 vi.mock("@tanstack/react-start", () => ({
@@ -64,7 +66,7 @@ function memoryDatabase(admin = true) {
 
 // Invoke the actual handler body; middleware transport is intentionally not part of this mock test.
 const invoke = (fn: unknown, db: ReturnType<typeof memoryDatabase>, data?: Row) =>
-  (fn as (arg: unknown) => Promise<any>)({ data, context: { supabase: db.sb, userId: "isolated-admin" } });
+  (service.db = db.sb, (fn as (arg: unknown) => Promise<any>)({ data, context: { supabase: db.sb, userId: "isolated-admin" } }));
 const publishInput = { id: jobId, subject_id: subjectId, rights_basis: "licensed", confirmed: true };
 
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
@@ -106,6 +108,23 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     next.tables.curriculum_topic_meta[0].review_status='approved';
     await invoke(publishExtractorJob,next,{...publishInput,topic_id:topicOwn});
     expect(next.tables.materials).toHaveLength(1);
+  });
+  it("sends manual audit units through the same visible review and publication gate", async () => {
+    const db = memoryDatabase();
+    db.tables.extractor_jobs[0].worker_rule_version = "pathy-batch-v1";
+    db.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'approved'}];
+    const original = {unit_id:'legacy-1',content_text:'source text'};
+    const raw = rawUnit(0, { content_text:'source text', requires_manual_review:true, usable_for_learning:false,
+      source:{sha256:sha,intake_mode:'manual_audit',legacy_unit_id:'legacy-1',original_audit_unit:original} });
+    db.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw});
+    const before = await invoke(refreshExtractorJob, db, {id:jobId});
+    expect(before.units[0]).toMatchObject({decision:'review',publish:false,content_text:'source text'});
+    await invoke(saveExtractorUnitReview,db,{id:jobId,unit_id:'u0',choice:'keep_original',reviewed_text:null});
+    const after = await invoke(refreshExtractorJob, db, {id:jobId});
+    expect(after.units[0]).toMatchObject({decision:'review',publish:true});
+    await invoke(publishExtractorJob,db,{...publishInput,topic_id:topicOwn});
+    expect(db.tables.materials).toHaveLength(1);
+    expect(db.tables.materials[0].extractor_metadata.original_unit.source.original_audit_unit).toEqual(original);
   });
   it("preserves a matching legacy import and rejects a conflicting one", async () => {
     const db = memoryDatabase(); const raw = rawUnit(0);

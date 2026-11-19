@@ -1,5 +1,6 @@
-// Pure, client-safe logic for the source-file -> Extractor worker -> Pathy pipeline.
-// HTTP contract: docs/extractor-worker-contract.md (pathy_extractor/worker_service_v06.py).
+// Client-safe source and publication rules. Legacy response parsers below are
+// retained for historical contract validation; the application does not call
+// the retired HTTP worker.
 
 export const SOURCE_EXTENSIONS = ["pdf", "docx", "txt", "md", "xlsx", "csv", "png", "jpg", "jpeg"] as const;
 export const MAX_SOURCE_BYTES = 160 * 1024 * 1024;

@@ -6,10 +6,15 @@ server interface. Actions never receive a Supabase service-role key or direct
 database credentials. The existing server-side Supabase service-role credential
 is used only by the Pathy server for the restricted SQL functions and Storage.
 
-**Implementation remains incomplete:** the legacy book and audit-staging
-imports have not yet been routed through the job/review/publication intake.
-Cross-path duplicate detection does not make them one intake. Do not deploy or
-enable this draft as the completed EXT-02 / LIB-01 solution.
+**Implementation remains incomplete:** the Extractor book and audit entry
+points now use job/review/publication intake, but the existing CSV, PCS and
+community material flows have not all been moved to that common contract.
+Do not deploy or enable this draft as the completed EXT-02 / LIB-01 solution.
+In particular, `admin-materials.functions.ts` can create topics and update
+existing materials, `pcs.functions.ts` still calls the independent PCS import
+RPCs, and community candidates have their own publication state. Those
+behaviors and their existing data must be reconciled without silently rewriting
+published content, inventing curriculum links, or removing the existing forms.
 
 Before enabling, review the migrations and the deployment target, determine the
 existing GitHub Actions plan, available included minutes and spending limits,
@@ -17,6 +22,10 @@ and obtain approval for the specific run if it could incur cost. Review the
 actual deployed application SHA and approved Python `main` SHA independently;
 do not infer either from editor state. Verify the workflow is present in private
 repository `victortsatryan/pathy-content-pipeline` on that exact main SHA.
+Confirm that the target schema includes the required accepted security changes
+and that the managed platform supports applying the selected migrations without
+replaying unrelated SQL. Use the previously documented maintenance and support
+procedure; do not repair migration records or apply changes as part of setup.
 
 Configure the Pathy server through its supported secret/configuration interface:
 
@@ -51,6 +60,24 @@ Supabase host, verifies bytes, runs the existing extractor, then sends the
 private source-bound result for transactional insertion into existing job units.
 No logs or Actions artifacts contain source/results. Timeout, error and conflicts
 fail closed; no automatic dispatch retry is made after an uncertain response.
+
+For an existing audit JSON file, the admin first uploads the corresponding
+original file, then selects the matching job by source SHA in the existing
+import form. Both former audit entry points use the same job transaction. The
+server verifies the original bytes again and preserves each original audit
+object; block linkage is explicitly recorded as unverified. Each unit requires
+human review before any publication, which additionally requires confirmed
+rights and an approved topic. Identical retries preserve saved reviews; changed
+payloads are rejected. Historical audit-staging rows remain readable. New
+direct staging writes and client mutations of raw jobs/units are revoked.
+The two migrations are `20261119120000_ext02_batch_jobs.sql` (batch and
+manual transaction) and `20261119121000_ext02_audit_archive_readonly.sql`
+(write revocations). The second migration is incompatible with the old
+server's direct writes: rehearse and drain old requests in an approved
+maintenance window before applying it, then deploy the compatible server.
+Keep the protected database and compatible server for rollback. Do not
+restore old grants or replay earlier migrations without a separate reviewed
+procedure. Existing staging, job, unit and review records are retained.
 
 Validate in an already authorized isolated environment: roles, direct REST denial,
 private-source access, run/SHA mismatch, one-run concurrency, byte and result
