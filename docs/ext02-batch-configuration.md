@@ -15,6 +15,9 @@ existing materials, `pcs.functions.ts` still calls the independent PCS import
 RPCs, and community candidates have their own publication state. Those
 behaviors and their existing data must be reconciled without silently rewriting
 published content, inventing curriculum links, or removing the existing forms.
+CSV preview is now read-only and counts valid rows only; it does not predict
+whether a row would be inserted or updated. This fix does not move CSV writes
+into the common intake.
 
 Before enabling, review the migrations and the deployment target, determine the
 existing GitHub Actions plan, available included minutes and spending limits,
