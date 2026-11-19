@@ -8,7 +8,10 @@ import {
   canPublishWithRights, classifyUnit, effectivePublication, kindToMaterialType, parseResultPage,
   parseWorkerStatus, sourceExtension, stableUnitKey, workerCorrectionVersion,
 } from "./pipeline";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { dispatchBatch } from "./actions-dispatch.server";
 import { verifySourceResponse } from "./source-verification.server";
+import { canonicalJson } from "./schema";
 import { needsContentReview, topicBelongsToSubject } from "./topic-linking";
 import { sourceUnitQuality } from "./source-sections";
 import {
@@ -27,16 +30,9 @@ async function assertAdmin(sb: Sb, userId: string) {
   if (!data) throw new Error("Доступ только администратору");
 }
 
-/** Server-only worker config. Requires an external https URL and a token. */
+/** Historical HTTP worker is excluded; old results remain readable. */
 function worker(): { url: string; token: string } | { error: string } | null {
-  const url = process.env["PATHY_EXTRACTOR_API_URL"];
-  const token = process.env["PATHY_EXTRACTOR_API_TOKEN"];
-  if (!url || !token) return null;
-  try {
-    const u = new URL(url);
-    if (u.protocol !== "https:" || ["localhost", "127.0.0.1"].includes(u.hostname)) return { error: "PATHY_EXTRACTOR_API_URL должен быть внешним https-адресом" };
-  } catch { return { error: "PATHY_EXTRACTOR_API_URL некорректен" }; }
-  return { url: url.replace(/\/+$/, ""), token };
+  return null;
 }
 
 async function call(w: { url: string; token: string }, path: string, init?: RequestInit) {
@@ -73,21 +69,15 @@ async function update(sb: Sb, id: string, patch: Database["public"]["Tables"]["e
   if (r.error) throw new Error(r.error.message);
 }
 
-/** POST /v1/jobs with a signed URL; the worker downloads the file itself and validates the SHA. */
-async function dispatch(sb: Sb, id: string) {
-  const job = await loadJob(sb, id);
-  const w = worker();
-  if (!w) return update(sb, id, { status: "worker_not_configured", progress: 0, error: "Обработчик не подключён: не заданы PATHY_EXTRACTOR_API_URL и PATHY_EXTRACTOR_API_TOKEN" });
-  if ("error" in w) return update(sb, id, { status: "worker_not_configured", error: w.error });
-  const signed = await sb.storage.from(BUCKET).createSignedUrl(job.storage_path, 3600);
-  if (signed.error || !signed.data?.signedUrl) return update(sb, id, { status: "failed", error: "Не удалось создать ссылку на файл: " + (signed.error?.message ?? "") });
-  try {
-    const body = await call(w, "/v1/jobs", { method: "POST", body: JSON.stringify({ job_id: job.id, source_url: signed.data.signedUrl, source_sha256: job.file_sha256, filename: job.file_name }) });
-    if (body?.job_id !== job.id) throw new Error("Обработчик вернул другой job_id");
-    await update(sb, id, { status: "queued", stage: String(body.stage ?? "queued"), progress: 0, error: null, external_job_id: job.id, attempts: job.attempts + 1, result_next_offset: null, result_total_units: null });
-  } catch (e) {
-    console.error("extractor dispatch failed", e);
-    await update(sb, id, { status: "failed", error: e instanceof Error ? e.message : "Обработчик недоступен", attempts: job.attempts + 1 });
+/** Queue only through the bounded GitHub Actions path. */
+async function dispatch(sb: Sb, id: string, userId: string) {
+  try { await dispatchBatch(id, userId); }
+  catch (error) {
+    // A dispatch timeout may still have created a run. Never undo a reserved
+    // job or automatically start a second one.
+    const result = await sb.from("extractor_jobs").update({ status: "worker_not_configured", error: "Пакетная обработка ожидает настройки, проверки лимита или истечения резерва", updated_at: new Date().toISOString() }).eq("id", id).eq("status", "uploaded");
+    if (result.error) throw new Error(result.error.message);
+    throw error;
   }
 }
 
@@ -100,8 +90,8 @@ export const getExtractorJobs = createServerFn({ method: "GET" }).middleware([re
       context.supabase.from("topics").select("id,title,subject_id").order("sort_order").limit(2000),
     ]);
     if (jobs.error) throw new Error(jobs.error.message);
-    const w = worker();
-    return { jobs: jobs.data ?? [], subjects: subjects.data ?? [], topics: topics.data ?? [], workerConfigured: !!w && !("error" in w) };
+    const ready = process.env.PATHY_ACTIONS_COST_APPROVED === "true" && !!process.env.PATHY_ACTIONS_APPROVED_JOB_ID && !!process.env.PATHY_ACTIONS_DISPATCH_TOKEN && /^[0-9a-f]{40}$/.test(process.env.PATHY_ACTIONS_CODE_SHA ?? "") && /^\d+$/.test(process.env.PATHY_ACTIONS_REPOSITORY_ID ?? "");
+    return { jobs: jobs.data ?? [], subjects: subjects.data ?? [], topics: topics.data ?? [], workerConfigured: ready };
   });
 
 export const registerExtractorUpload = createServerFn({ method: "POST" }).middleware([requireSupabaseAuth])
@@ -155,7 +145,7 @@ export const registerExtractorUpload = createServerFn({ method: "POST" }).middle
       }
       throw new Error(ins.error.message);
     }
-    await dispatch(sb, ins.data.id);
+    await dispatch(sb, ins.data.id, context.userId);
     return { id: ins.data.id, duplicate: false };
   });
 
@@ -165,12 +155,7 @@ export const retryExtractorJob = createServerFn({ method: "POST" }).middleware([
     await assertAdmin(context.supabase, context.userId);
     const job = await loadJob(context.supabase, data.id);
     if (!["failed", "worker_not_configured", "uploaded"].includes(job.status)) throw new Error("Повтор возможен только после ошибки");
-    // A reprocess revision may only be re-sent to a worker that still runs the verified corrector.
-    if ((job.revision ?? 1) > 1) {
-      const version = await correctionWorkerVersion();
-      await update(context.supabase, job.id, { worker_rule_version: version });
-    }
-    await dispatch(context.supabase, data.id);
+    await dispatch(context.supabase, data.id, context.userId);
     return { ok: true };
   });
 
@@ -191,8 +176,7 @@ export const reprocessExtractorJob = createServerFn({ method: "POST" }).middlewa
     if (root.file_sha256 !== picked.file_sha256) throw new Error("SHA-256 версии не совпадает с исходной обработкой");
     if (!(REPROCESS_ROOT_STATUSES as readonly string[]).includes(root.status)) throw new Error("Исходная обработка ещё не завершена");
     if (!root.storage_path.startsWith(`${root.file_sha256}/`)) throw new Error("Путь исходного файла не соответствует SHA-256");
-    // Health gate BEFORE any write: no row is created unless the corrector is actually deployed.
-    const version = await correctionWorkerVersion();
+    const version = "pathy-batch-v1";
     const info = await sb.storage.from(BUCKET).info(root.storage_path);
     if (info.error || !info.data) throw new Error("Исходный файл не найден в хранилище — повторная обработка не создана");
     if (Number(info.data.size ?? 0) !== Number(root.size_bytes)) throw new Error("Размер исходного файла изменился — повторная обработка не создана");
@@ -214,7 +198,7 @@ export const reprocessExtractorJob = createServerFn({ method: "POST" }).middlewa
       newId = ins.data.id;
     }
     if (!newId) throw new Error("Не удалось выделить номер версии — повторите позже");
-    await dispatch(sb, newId);
+    await dispatch(sb, newId, context.userId);
     const fresh = await loadJob(sb, newId);
     return { id: newId, revision: fresh.revision, status: fresh.status, error: fresh.error, worker_rule_version: version };
   });
@@ -254,6 +238,10 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
     const sb = context.supabase;
     await assertAdmin(sb, context.userId);
     const job = await loadJob(sb, data.id);
+    if (["queued", "processing"].includes(job.status)) {
+      const expired = await (supabaseAdmin as any).rpc("ext02_expire_job", { p_job: job.id, p_user: context.userId });
+      if (expired.error) throw new Error("Не удалось проверить срок обработки");
+    }
     const w = worker();
     const ok = w && !("error" in w) ? w : null;
     if (ok && job.external_job_id) {
@@ -393,6 +381,11 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
     const job = await loadJob(sb, data.id);
     if (!canPublishRevision(job.revision)) throw new Error("Повторная обработка (версия " + job.revision + ") не публикуется: нужен отдельный аудит и явное решение о замене");
     if (!["succeeded", "publishing", "published"].includes(job.status)) throw new Error("Результат обработки ещё не получен полностью");
+    if (job.worker_rule_version === "pathy-batch-v1" && !topicId) throw new Error("Для публикации нужна утверждённая тема");
+    if (job.worker_rule_version === "pathy-batch-v1" && topicId) {
+      const approved = await sb.from("curriculum_topic_meta").select("review_status").eq("topic_id", topicId).maybeSingle();
+      if (approved.error || approved.data?.review_status !== "approved") throw new Error("Тема не утверждена — публикация остановлена");
+    }
     await update(sb, job.id, { status: "publishing", rights_basis: data.rights_basis, subject_id: data.subject_id });
     const decisions = (job.unit_decisions ?? {}) as Record<string, "accept" | "reject">;
     const batch = await sb.from("extractor_job_units").select("id,unit_id,raw,reviewed_text,review_choice,reviewed_by,reviewed_at").eq("job_id", job.id).eq("publish_state", "pending").order("position").limit(PUBLISH_BATCH);
@@ -404,12 +397,40 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
       const u = classifyUnit(raw, job.author);
       const mark = (publish_state: "published" | "existing" | "skipped" | "failed", extra: { material_id?: string; publish_error?: string } = {}) =>
         sb.from("extractor_job_units").update({ publish_state, ...extra }).eq("id", row.id);
+      if (job.worker_rule_version === "pathy-batch-v1" && (!row.reviewed_by || !row.reviewed_at || !["keep_original", "accept_corrected"].includes(row.review_choice ?? ""))) {
+        await mark("skipped"); r.skipped++; continue;
+      }
       const eff = effectivePublication(u, row.review_choice as any, row.reviewed_text, decisions[u.unit_id]);
       if (!eff.publish) { await mark("skipped"); r.skipped++; continue; }
       const key = stableUnitKey(job.file_sha256, u.unit_id);
-      const prior = await sb.from("materials").select("id").eq("extractor_metadata->>unit_key", key).maybeSingle();
+      const prior = await sb.from("materials").select("id,extractor_metadata,subject_id").eq("extractor_metadata->>unit_key", key).maybeSingle();
       if (prior.error) throw new Error(prior.error.message);
-      if (prior.data) { await mark("existing", { material_id: prior.data.id }); r.existing++; continue; }
+      if (prior.data) {
+        const metadata = prior.data.extractor_metadata as Record<string, any> | null;
+        if (prior.data.subject_id !== data.subject_id || canonicalJson(metadata?.original_unit) !== canonicalJson(raw)) {
+          throw new Error("Конфликт ранее импортированной единицы; сохранённый материал не изменён");
+        }
+        await mark("existing", { material_id: prior.data.id }); r.existing++; continue;
+      }
+      // The legacy book importer stored source SHA + unit_id but no unit_key.
+      // Never create a second material for it, or silently adopt conflicting data.
+      const legacy = await sb.from("materials").select("id,extractor_metadata,subject_id")
+        .eq("extractor_metadata->>unit_id", u.unit_id).limit(100);
+      if (legacy.error) throw new Error(legacy.error.message);
+      if ((legacy.data ?? []).length >= 100) throw new Error("Слишком много совпадений unit_id; нужна ручная проверка");
+      const sameSource = (legacy.data ?? []).filter((m) => {
+        const metadata = m.extractor_metadata as Record<string, any> | null;
+        return metadata?.source_sha256 === job.file_sha256;
+      });
+      if (sameSource.length > 1) throw new Error("Найдены неоднозначные существующие материалы источника");
+      if (sameSource.length === 1) {
+        const existing = sameSource[0];
+        const metadata = existing.extractor_metadata as Record<string, any> | null;
+        if (existing.subject_id !== data.subject_id || canonicalJson(metadata?.original_unit) !== canonicalJson(raw)) {
+          throw new Error("Конфликт ранее импортированной единицы; сохранённый материал не изменён");
+        }
+        await mark("existing", { material_id: existing.id }); r.existing++; continue;
+      }
       const provenance = {
         unit_key: key, job_id: job.id, unit_id: u.unit_id, source_sha256: job.file_sha256, source_file: job.file_name, pages: u.pages,
         role: u.role, related_unit_ids: u.related_unit_ids, classification: u.decision, review_reasons: u.reasons,
@@ -427,8 +448,12 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
       }).select("id").single();
       if (mat.error) {
         if (mat.error.code === "23505") {
-          const existing = await sb.from("materials").select("id").eq("extractor_metadata->>unit_key", key).maybeSingle();
-          if (!existing.error && existing.data) { await mark("existing", { material_id: existing.data.id }); r.existing++; continue; }
+          const existing = await sb.from("materials").select("id,extractor_metadata,subject_id").eq("extractor_metadata->>unit_key", key).maybeSingle();
+          if (!existing.error && existing.data) {
+            const metadata = existing.data.extractor_metadata as Record<string, any> | null;
+            if (existing.data.subject_id !== data.subject_id || canonicalJson(metadata?.original_unit) !== canonicalJson(raw)) throw new Error("Конфликт одновременно импортированной единицы");
+            await mark("existing", { material_id: existing.data.id }); r.existing++; continue;
+          }
         }
         await mark("failed", { publish_error: mat.error.message }); r.failed++; continue;
       }

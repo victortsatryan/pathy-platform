@@ -16,6 +16,7 @@ import { Route as AuthenticatedIndexRouteImport } from './routes/_authenticated.
 import { Route as DevNavigationRouteImport } from './routes/dev.navigation'
 import { Route as DevDataHealthRouteImport } from './routes/dev.data-health'
 import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
+import { Route as ApiExt02BatchRouteImport } from './routes/api/ext02-batch'
 import { Route as AuthenticatedTeacherRouteImport } from './routes/_authenticated.teacher'
 import { Route as AuthenticatedStudentRouteImport } from './routes/_authenticated.student'
 import { Route as AuthenticatedProfileRouteImport } from './routes/_authenticated.profile'
@@ -107,6 +108,11 @@ const DevDataHealthRoute = DevDataHealthRouteImport.update({
 const AuthCallbackRoute = AuthCallbackRouteImport.update({
   id: '/auth/callback',
   path: '/auth/callback',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiExt02BatchRoute = ApiExt02BatchRouteImport.update({
+  id: '/api/ext02-batch',
+  path: '/api/ext02-batch',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AuthenticatedTeacherRoute = AuthenticatedTeacherRouteImport.update({
@@ -458,6 +464,7 @@ export interface FileRoutesByFullPath {
   '/profile': typeof AuthenticatedProfileRoute
   '/student': typeof AuthenticatedStudentRouteWithChildren
   '/teacher': typeof AuthenticatedTeacherRouteWithChildren
+  '/api/ext02-batch': typeof ApiExt02BatchRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/dev/data-health': typeof DevDataHealthRoute
   '/dev/navigation': typeof DevNavigationRoute
@@ -520,6 +527,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/onboarding': typeof AuthenticatedOnboardingRoute
   '/profile': typeof AuthenticatedProfileRoute
+  '/api/ext02-batch': typeof ApiExt02BatchRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/dev/data-health': typeof DevDataHealthRoute
   '/dev/navigation': typeof DevNavigationRoute
@@ -587,6 +595,7 @@ export interface FileRoutesById {
   '/_authenticated/profile': typeof AuthenticatedProfileRoute
   '/_authenticated/student': typeof AuthenticatedStudentRouteWithChildren
   '/_authenticated/teacher': typeof AuthenticatedTeacherRouteWithChildren
+  '/api/ext02-batch': typeof ApiExt02BatchRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/dev/data-health': typeof DevDataHealthRoute
   '/dev/navigation': typeof DevNavigationRoute
@@ -656,6 +665,7 @@ export interface FileRouteTypes {
     | '/profile'
     | '/student'
     | '/teacher'
+    | '/api/ext02-batch'
     | '/auth/callback'
     | '/dev/data-health'
     | '/dev/navigation'
@@ -718,6 +728,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/onboarding'
     | '/profile'
+    | '/api/ext02-batch'
     | '/auth/callback'
     | '/dev/data-health'
     | '/dev/navigation'
@@ -784,6 +795,7 @@ export interface FileRouteTypes {
     | '/_authenticated/profile'
     | '/_authenticated/student'
     | '/_authenticated/teacher'
+    | '/api/ext02-batch'
     | '/auth/callback'
     | '/dev/data-health'
     | '/dev/navigation'
@@ -847,6 +859,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   AuthenticatedRoute: typeof AuthenticatedRouteWithChildren
   LoginRoute: typeof LoginRoute
+  ApiExt02BatchRoute: typeof ApiExt02BatchRoute
   AuthCallbackRoute: typeof AuthCallbackRoute
   DevDataHealthRoute: typeof DevDataHealthRoute
   DevNavigationRoute: typeof DevNavigationRoute
@@ -902,6 +915,13 @@ declare module '@tanstack/react-router' {
       path: '/auth/callback'
       fullPath: '/auth/callback'
       preLoaderRoute: typeof AuthCallbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/ext02-batch': {
+      id: '/api/ext02-batch'
+      path: '/api/ext02-batch'
+      fullPath: '/api/ext02-batch'
+      preLoaderRoute: typeof ApiExt02BatchRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/_authenticated/teacher': {
@@ -1497,6 +1517,7 @@ const AuthenticatedRouteWithChildren = AuthenticatedRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   AuthenticatedRoute: AuthenticatedRouteWithChildren,
   LoginRoute: LoginRoute,
+  ApiExt02BatchRoute: ApiExt02BatchRoute,
   AuthCallbackRoute: AuthCallbackRoute,
   DevDataHealthRoute: DevDataHealthRoute,
   DevNavigationRoute: DevNavigationRoute,

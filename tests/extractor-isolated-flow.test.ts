@@ -37,7 +37,7 @@ function memoryDatabase(admin = true) {
       let action = "select", payload: any, limit = Infinity, single = false, count = false;
       const q: any = {
         select: (_fields?: string, opts?: Row) => { count = opts?.count === "exact"; return q; },
-        eq: (key: string, value: unknown) => { filters.push(r => (key === "extractor_metadata->>unit_key" ? r.extractor_metadata?.unit_key : r[key]) === value); return q; },
+        eq: (key: string, value: unknown) => { filters.push(r => (key.startsWith("extractor_metadata->>") ? r.extractor_metadata?.[key.split("->>")[1]] : r[key]) === value); return q; },
         order: () => q, limit: (n: number) => { limit = n; return q; },
         single: () => { single = true; return q; }, maybeSingle: () => { single = true; return q; },
         update: (value: Row) => { action = "update"; payload = value; return q; },
@@ -90,6 +90,35 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     await expect(invoke(publishExtractorJob, db, { ...publishInput, rights_basis: "unknown" })).rejects.toThrow("Права");
     expect(db.writes()).toBe(0);
   });
+  it("requires a saved human decision and an approved topic for batch results", async () => {
+    const db = memoryDatabase();
+    db.tables.extractor_jobs[0].worker_rule_version = "pathy-batch-v1";
+    db.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'approved'}];
+    db.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw:rawUnit(0)});
+    await expect(invoke(publishExtractorJob,db,publishInput)).rejects.toThrow('утверждённая тема');
+    await invoke(publishExtractorJob,db,{...publishInput,topic_id:topicOwn});
+    expect(db.tables.materials).toHaveLength(0);
+    const next = memoryDatabase();
+    next.tables.extractor_jobs[0].worker_rule_version = "pathy-batch-v1";
+    next.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'draft'}];
+    next.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw:rawUnit(0),review_choice:'keep_original',reviewed_by:'admin',reviewed_at:'2026-01-01'});
+    await expect(invoke(publishExtractorJob,next,{...publishInput,topic_id:topicOwn})).rejects.toThrow('не утверждена');
+    next.tables.curriculum_topic_meta[0].review_status='approved';
+    await invoke(publishExtractorJob,next,{...publishInput,topic_id:topicOwn});
+    expect(next.tables.materials).toHaveLength(1);
+  });
+  it("preserves a matching legacy import and rejects a conflicting one", async () => {
+    const db = memoryDatabase(); const raw = rawUnit(0);
+    db.tables.materials.push({id:'old',subject_id:subjectId,extractor_metadata:{unit_id:raw.unit_id,source_sha256:sha,original_unit:raw}});
+    db.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:raw.unit_id,publish_state:'pending',raw});
+    await invoke(publishExtractorJob,db,publishInput);
+    expect(db.tables.materials).toHaveLength(1);
+    db.tables.extractor_job_units[0].publish_state='pending';
+    db.tables.extractor_job_units[0].raw={...raw,content_text:'conflict'};
+    await expect(invoke(publishExtractorJob,db,publishInput)).rejects.toThrow('Конфликт');
+    expect(db.tables.materials).toHaveLength(1);
+    expect(db.tables.materials[0].extractor_metadata.original_unit.content_text).toBe(raw.content_text);
+  });
   it("runs review -> batched publication -> repeat with attribution, privacy and no grading", async () => {
     const db = memoryDatabase();
     const raws = [rawUnit(0), rawUnit(1, { requires_manual_review: true }), rawUnit(2, { role: "teacher_private", content_text: "27. answer" }), ...Array.from({ length: 31 }, (_, i) => rawUnit(i + 3))];
@@ -119,21 +148,15 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     await invoke(publishExtractorJob, db, publishInput);
     expect(db.tables.materials).toHaveLength(0);
   });
-  it("pulls real-format result pages and replays them idempotently in memory", async () => {
+  it("does not contact the retired HTTP worker when reopening a historical job", async () => {
     const db = memoryDatabase();
-    Object.assign(db.tables.extractor_jobs[0], { status: "fetching_result", external_job_id: jobId, result_next_offset: 0, result_total_units: null });
-    vi.stubEnv("PATHY_EXTRACTOR_API_URL", "https://worker.invalid"); vi.stubEnv("PATHY_EXTRACTOR_API_TOKEN", "isolated-fixture");
-    const fetchMock = vi.fn(async (url: string) => {
-      const offset = Number(new URL(url).searchParams.get("offset"));
-      const units = Array.from({ length: offset === 0 ? 40 : 5 }, (_, i) => rawUnit(offset + i));
-      return new Response(JSON.stringify({ format: "pathy-extraction-result-v1", source: { sha256: sha }, summary: { total_units: 45 }, units, next_offset: offset === 0 ? 40 : null }));
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    expect((await invoke(refreshExtractorJob, db, { id: jobId })).job.status).toBe("succeeded");
-    expect(db.tables.extractor_job_units).toHaveLength(45); expect(fetchMock).toHaveBeenCalledTimes(2);
-    Object.assign(db.tables.extractor_jobs[0], { status: "fetching_result", result_next_offset: 0 });
+    Object.assign(db.tables.extractor_jobs[0], { status: "fetching_result", external_job_id: jobId });
+    vi.stubEnv("PATHY_EXTRACTOR_API_URL", "https://worker.invalid");
+    vi.stubEnv("PATHY_EXTRACTOR_API_TOKEN", "isolated-fixture");
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
     await invoke(refreshExtractorJob, db, { id: jobId });
-    expect(db.tables.extractor_job_units).toHaveLength(45);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(db.tables.extractor_job_units).toHaveLength(0);
   });
 });
 describe("explicit admin topic assignment (isolated mock DB)", () => {

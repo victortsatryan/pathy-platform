@@ -113,7 +113,7 @@ function UploadPage() {
         <p className="text-sm text-muted-foreground">PDF, DOCX, TXT, MD, XLSX, CSV, PNG или JPEG до 160 MB. Файл разбирается обработчиком Pathy Content Extractor; уверенные блоки публикуются без ручной проверки, сомнительные — показываются отдельно.</p>
         {data && !data.workerConfigured && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
-            Обработчик не подключён. Файлы сохраняются, но разбор не запускается, пока в настройках проекта не заданы адрес и ключ обработчика.
+            Пакетная обработка ожидает настройки защищённого запуска и подтверждения лимита расходов.
           </div>
         )}
         <div className="grid gap-3 md:grid-cols-3">

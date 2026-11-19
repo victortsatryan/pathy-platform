@@ -144,7 +144,7 @@ export function canPublishRevision(revision: number | null | undefined): boolean
 
 /** Jobs that already ran to completion (or failed) and may be used to start a new revision. */
 export const REPROCESS_ROOT_STATUSES = ["succeeded", "published"] as const;
-export const IN_FLIGHT_STATUSES = ["uploaded", "queued", "processing", "fetching_result"] as const;
+export const IN_FLIGHT_STATUSES = ["uploaded", "worker_not_configured", "queued", "processing", "fetching_result"] as const;
 
 /** Stable identity across re-runs: source SHA + extractor unit id. */
 export function stableUnitKey(sha: string, unitId: string): string {

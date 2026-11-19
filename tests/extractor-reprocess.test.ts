@@ -127,97 +127,40 @@ describe("pure revision rules", () => {
   });
 });
 
-describe("reprocessExtractorJob (isolated mock DB + worker)", () => {
+function seedRevision(db: ReturnType<typeof memoryDb>) {
+  const revision = { ...db.tables.extractor_jobs[0], id: "rev-2", revision: 2, parent_job_id: rootId,
+    status: "succeeded", worker_rule_version: OCR_CORRECTION_VERSION };
+  db.tables.extractor_jobs.push(revision);
+  return revision;
+}
+
+describe("reprocessExtractorJob with disabled batch configuration", () => {
   it.each(["student", "teacher"])("denies %s before any network call or write", async () => {
     const db = memoryDb(false); const calls = stubWorker(goodHealth);
     await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("администратору");
     expect(calls).toHaveLength(0); expect(db.writes()).toBe(0);
   });
-
-  it.each([
-    ["health without correction version (current live worker shape)", { status: "live", service: "pathy-content-extractor" }],
-    ["other version", { ocr_correction_version: "pathy-ocr-postcorrection-v0" }],
-  ])("fails safe on %s: no job created, nothing dispatched", async (_n, health) => {
-    const db = memoryDb(); const calls = stubWorker(health);
-    await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("не создана");
-    expect(db.tables.extractor_jobs).toHaveLength(1);
-    expect(calls.map((c) => c.url)).toEqual(["https://worker.invalid/health"]);
-    expect(db.writes()).toBe(0); expect(db.unchanged()).toBe(true);
-  });
-
-  it("fails safe when worker is not configured or unreachable", async () => {
-    vi.stubEnv("PATHY_EXTRACTOR_API_URL", ""); const db = memoryDb(); const calls = stubWorker(goodHealth);
-    await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("не подключён");
-    expect(calls).toHaveLength(0);
-    vi.stubEnv("PATHY_EXTRACTOR_API_URL", "https://worker.invalid");
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("down", { status: 503 })));
-    await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("повторная обработка не создана");
-    expect(db.tables.extractor_jobs).toHaveLength(1); expect(db.writes()).toBe(0);
-  });
-
-  it("creates revision 2 with cloned source/SHA/rights and a fresh UUID; original untouched", async () => {
+  it("leaves the new revision waiting and never calls the legacy worker", async () => {
     const db = memoryDb(); const calls = stubWorker(goodHealth);
-    const r = await invoke(reprocessExtractorJob, db, { id: rootId });
-    expect(r).toMatchObject({ revision: 2, status: "queued", worker_rule_version: OCR_CORRECTION_VERSION });
-    const rev = db.tables.extractor_jobs.find((j) => j.id === r.id)!;
-    expect(rev.id).not.toBe(rootId);
-    expect(rev).toMatchObject({ file_sha256: sha, storage_path: path, file_name: "goltsova.pdf", author: "Гольцова", rights_basis: "public_domain",
-      subject_id: subjectId, parent_job_id: rootId, revision: 2, worker_rule_version: OCR_CORRECTION_VERSION, created_by: "admin-1", external_job_id: r.id });
-    const post = calls.find((c) => c.method === "POST")!;
-    expect(post.body).toEqual({ job_id: r.id, source_url: `https://storage.invalid/${path}?token=signed`, source_sha256: sha, filename: "goltsova.pdf" });
-    expect(calls.every((c) => c.auth === "Bearer isolated-fixture")).toBe(true);
-    expect(db.unchanged()).toBe(true);
-    expect(db.tables.extractor_job_units.filter((u) => u.job_id === r.id)).toHaveLength(0);
-  });
-
-  it("refuses a second run while one is in flight, then allows revision 3 after completion", async () => {
-    const db = memoryDb(); stubWorker(goodHealth);
-    const first = await invoke(reprocessExtractorJob, db, { id: rootId });
+    await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("ожидает");
+    expect(db.tables.extractor_jobs[1]).toMatchObject({ revision: 2, status: "worker_not_configured", parent_job_id: rootId });
+    expect(calls).toHaveLength(0); expect(db.unchanged()).toBe(true);
     await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("уже выполняется");
-    db.tables.extractor_jobs.find((j) => j.id === first.id)!.status = "succeeded";
-    const third = await invoke(reprocessExtractorJob, db, { id: first.id });
-    expect(third.revision).toBe(3);
-    expect(db.tables.extractor_jobs.find((j) => j.id === third.id)!.parent_job_id).toBe(rootId);
   });
-
-  it("retries the revision number on a unique conflict instead of overwriting", async () => {
-    const db = memoryDb(); stubWorker(goodHealth);
-    db.setBeforeInsert((rows) => rows.push({ id: "concurrent", file_sha256: sha, revision: 2, status: "failed", parent_job_id: rootId }));
-    const r = await invoke(reprocessExtractorJob, db, { id: rootId });
-    expect(r.revision).toBe(3);
-    expect(db.tables.extractor_jobs.filter((j) => j.revision === 2)).toHaveLength(1);
-  });
-
-  it("dispatch failure keeps a failed revision with a real error, never reports success", async () => {
-    const db = memoryDb(); stubWorker(goodHealth, { postStatus: 500 });
-    const r = await invoke(reprocessExtractorJob, db, { id: rootId });
-    expect(r.status).toBe("failed"); expect(r.error).toContain("500");
-    expect(db.unchanged()).toBe(true);
-  });
-
-  it("rejects unfinished roots and a moved/missing source object", async () => {
+  it("rejects unfinished roots and invalid source paths", async () => {
     const db = memoryDb(); const calls = stubWorker(goodHealth);
     db.tables.extractor_jobs[0].status = "processing";
     await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("завершённых");
-    expect(calls).toHaveLength(0);
     db.tables.extractor_jobs[0].status = "published"; db.tables.extractor_jobs[0].storage_path = `${"b".repeat(64)}/x.pdf`;
     await expect(invoke(reprocessExtractorJob, db, { id: rootId })).rejects.toThrow("SHA-256");
-    expect(db.tables.extractor_jobs).toHaveLength(1);
-  });
-
-  it("retry of a failed revision re-checks the worker version before dispatching", async () => {
-    const db = memoryDb(); stubWorker(goodHealth, { postStatus: 500 });
-    const r = await invoke(reprocessExtractorJob, db, { id: rootId });
-    const calls = stubWorker({ status: "live" });
-    await expect(invoke(retryExtractorJob, db, { id: r.id })).rejects.toThrow("не создана");
-    expect(calls.some((c) => c.method === "POST")).toBe(false);
+    expect(calls).toHaveLength(0);
   });
 });
 
 describe("revision-safe upload dedup and publication guard", () => {
   it("re-upload of the same SHA returns the root revision even when revisions exist", async () => {
     const db = memoryDb(); stubWorker(goodHealth);
-    await invoke(reprocessExtractorJob, db, { id: rootId });
+    seedRevision(db);
     const content = "%PDF-1.7\nsynthetic";
     const sourceSha = createHash("sha256").update(content).digest("hex");
     const sourcePath = `${sourceSha}/synthetic.pdf`;
@@ -238,7 +181,7 @@ describe("revision-safe upload dedup and publication guard", () => {
 
   it("publishing a reprocess revision is refused before any write; old materials unchanged", async () => {
     const db = memoryDb(); stubWorker(goodHealth);
-    const r = await invoke(reprocessExtractorJob, db, { id: rootId });
+    const r = seedRevision(db);
     const rev = db.tables.extractor_jobs.find((j) => j.id === r.id)!;
     rev.status = "succeeded";
     db.tables.extractor_job_units.push({ id: "rev-u1", job_id: r.id, unit_id: "u1", publish_state: "pending",
@@ -271,7 +214,7 @@ describe("admin revision update of existing published materials", () => {
 
   it("applies only the approved unit, with original text preserved in history; a retry is idempotent", async () => {
     const db = memoryDb(); stubWorker(goodHealth);
-    const rev = await invoke(reprocessExtractorJob, db, { id: rootId });
+    const rev = seedRevision(db);
     const unit = makeReviewed(db, rev.id);
     const rootSnapshot = JSON.stringify(db.tables.extractor_jobs[0]);
     const oldUnitSnapshot = JSON.stringify(db.tables.extractor_job_units[0]);
@@ -298,7 +241,7 @@ describe("admin revision update of existing published materials", () => {
 
   it("never applies v1 OCR or unreviewed/teacher-private/wrong SHA corrections", async () => {
     const db = memoryDb(); stubWorker(goodHealth);
-    const rev = await invoke(reprocessExtractorJob, db, { id: rootId });
+    const rev = seedRevision(db);
     const unit = makeReviewed(db, rev.id);
     const job = db.tables.extractor_jobs.find(j => j.id === rev.id)!;
     const before = db.writes();
