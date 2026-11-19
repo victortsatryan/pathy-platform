@@ -87,6 +87,18 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     expect((await invoke(getExtractorJobs, db)).workerConfigured).toBe(false);
     expect(db.writes()).toBe(0); expect(fetchMock).not.toHaveBeenCalled();
   });
+  it("does not report readiness when the one-run approval is missing", async () => {
+    const db = memoryDatabase();
+    vi.stubEnv("PATHY_ACTIONS_COST_APPROVED", "true");
+    vi.stubEnv("PATHY_ACTIONS_APPROVED_JOB_ID", jobId);
+    vi.stubEnv("PATHY_ACTIONS_DISPATCH_TOKEN", "fixture");
+    vi.stubEnv("PATHY_ACTIONS_CODE_SHA", "a".repeat(40));
+    vi.stubEnv("PATHY_ACTIONS_REPOSITORY_ID", "1419587278");
+    vi.stubEnv("PATHY_ACTIONS_APPROVAL_ID", "");
+    expect((await invoke(getExtractorJobs, db)).workerConfigured).toBe(false);
+    vi.stubEnv("PATHY_ACTIONS_APPROVAL_ID", "20000000-0000-4000-8000-000000000001");
+    expect((await invoke(getExtractorJobs, db)).workerConfigured).toBe(true);
+  });
   it("rights gate denies unknown rights before any write", async () => {
     const db = memoryDatabase();
     await expect(invoke(publishExtractorJob, db, { ...publishInput, rights_basis: "unknown" })).rejects.toThrow("Права");

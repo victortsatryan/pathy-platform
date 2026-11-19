@@ -61,7 +61,7 @@ export const getExtractorJobs = createServerFn({ method: "GET" }).middleware([re
       context.supabase.from("topics").select("id,title,subject_id").order("sort_order").limit(2000),
     ]);
     if (jobs.error) throw new Error(jobs.error.message);
-    const ready = process.env.PATHY_ACTIONS_COST_APPROVED === "true" && !!process.env.PATHY_ACTIONS_APPROVED_JOB_ID && !!process.env.PATHY_ACTIONS_DISPATCH_TOKEN && /^[0-9a-f]{40}$/.test(process.env.PATHY_ACTIONS_CODE_SHA ?? "") && /^\d+$/.test(process.env.PATHY_ACTIONS_REPOSITORY_ID ?? "");
+    const ready = process.env.PATHY_ACTIONS_COST_APPROVED === "true" && z.string().uuid().safeParse(process.env.PATHY_ACTIONS_APPROVED_JOB_ID).success && !!process.env.PATHY_ACTIONS_DISPATCH_TOKEN && z.string().uuid().safeParse(process.env.PATHY_ACTIONS_APPROVAL_ID).success && /^[0-9a-f]{40}$/.test(process.env.PATHY_ACTIONS_CODE_SHA ?? "") && /^\d+$/.test(process.env.PATHY_ACTIONS_REPOSITORY_ID ?? "");
     return { jobs: jobs.data ?? [], subjects: subjects.data ?? [], topics: topics.data ?? [], workerConfigured: ready };
   });
 

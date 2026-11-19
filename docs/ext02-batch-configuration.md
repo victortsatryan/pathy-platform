@@ -6,18 +6,12 @@ server interface. Actions never receive a Supabase service-role key or direct
 database credentials. The existing server-side Supabase service-role credential
 is used only by the Pathy server for the restricted SQL functions and Storage.
 
-**Implementation remains incomplete:** the Extractor book and audit entry
-points now use job/review/publication intake, but the existing CSV, PCS and
-community material flows have not all been moved to that common contract.
-Do not deploy or enable this draft as the completed EXT-02 / LIB-01 solution.
-In particular, `admin-materials.functions.ts` can create topics and update
-existing materials, `pcs.functions.ts` still calls the independent PCS import
-RPCs, and community candidates have their own publication state. Those
-behaviors and their existing data must be reconciled without silently rewriting
-published content, inventing curriculum links, or removing the existing forms.
-CSV preview is now read-only and counts valid rows only; it does not predict
-whether a row would be inserted or updated. This fix does not move CSV writes
-into the common intake.
+**Scope:** EXT-02 provides the bounded Actions processing path. The existing
+CSV, PCS and community formats and educational models remain under LIB-01;
+they are not redesigned by this change. A local test or successful build is
+not evidence of a deployed revision or an accepted real end-to-end run.
+CSV preview is read-only and counts valid rows only; it does not predict
+whether a row would be inserted or updated.
 `20261119122000_community_author_status_guard.sql` independently closes direct
 author promotion and forged moderation fields while preserving existing rows
 and administrator moderation. It does not unify community publication.
@@ -93,3 +87,19 @@ verified secure Lovable secret/deploy mechanism remain release gates. A rollback
 turns both cost approvals off and removes the job approval; retain all existing
 jobs, units, results and manual decisions. Never revert to Cloud Run. Do not
 apply migrations to production until the controlled release is approved.
+
+For the local cross-repository contract check, generate a synthetic text result
+with `pathy_extractor.batch_execution_v06.run_batch_source` in the private
+pipeline checkout, write that result under `/tmp/`, then run
+`PATHY_EXT02_RESULT_FIXTURE=/tmp/pathy-synthetic-result.json node tests/ext02-python-artifact-pglite.mjs`
+in the platform checkout. Use synthetic inputs only; this test does not start
+Actions, connect to Supabase, or establish browser/production acceptance.
+
+The historical preservation gate is separate from the code test. Before
+claiming full preservation, obtain an authorized read-only download of the
+existing source PDF and verify its bytes, size and SHA-256; preserve the two
+existing extracted revisions, raw evidence, manual decisions and links; and
+inventory existing Google Cloud Storage / Cloud Shell data without enabling
+billing, running Cloud Run or deleting resources. Unavailable stores and the
+absence of a consistent export must remain explicit blockers, not evidence
+that nothing is missing.
