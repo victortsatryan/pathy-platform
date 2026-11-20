@@ -107,6 +107,7 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
   it("requires a saved human decision and an approved topic for batch results", async () => {
     const db = memoryDatabase();
     db.tables.extractor_jobs[0].worker_rule_version = "pathy-batch-v1";
+    db.tables.extractor_jobs[0].result = {pipeline_context:{source_block_linkage_complete:true}};
     db.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'approved'}];
     db.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw:rawUnit(0)});
     await expect(invoke(publishExtractorJob,db,publishInput)).rejects.toThrow('утверждённая тема');
@@ -114,6 +115,7 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     expect(db.tables.materials).toHaveLength(0);
     const next = memoryDatabase();
     next.tables.extractor_jobs[0].worker_rule_version = "pathy-batch-v1";
+    next.tables.extractor_jobs[0].result = {pipeline_context:{source_block_linkage_complete:true}};
     next.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'draft'}];
     next.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw:rawUnit(0),review_choice:'keep_original',reviewed_by:'admin',reviewed_at:'2026-01-01'});
     await expect(invoke(publishExtractorJob,next,{...publishInput,topic_id:topicOwn})).rejects.toThrow('не утверждена');
@@ -124,6 +126,7 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
   it("sends manual audit units through the same visible review and publication gate", async () => {
     const db = memoryDatabase();
     db.tables.extractor_jobs[0].worker_rule_version = "pathy-batch-v1";
+    db.tables.extractor_jobs[0].result = {pipeline_context:{mode:'manual_audit',source_block_linkage_complete:false}};
     db.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'approved'}];
     const original = {unit_id:'legacy-1',content_text:'source text'};
     const raw = rawUnit(0, { content_text:'source text', requires_manual_review:true, usable_for_learning:false,
@@ -137,6 +140,25 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     await invoke(publishExtractorJob,db,{...publishInput,topic_id:topicOwn});
     expect(db.tables.materials).toHaveLength(1);
     expect(db.tables.materials[0].extractor_metadata.original_unit.source.original_audit_unit).toEqual(original);
+  });
+  it("preserves incomplete-linkage evidence in review and blocks publication even after a decision", async () => {
+    const db = memoryDatabase();
+    const job = db.tables.extractor_jobs[0];
+    job.worker_rule_version = 'pathy-batch-v1'; job.stage = 'review_required';
+    job.result = {pipeline_context:{source_block_linkage_complete:false, source_sha256:sha, review_actionable_items:1}};
+    const raw: Row = rawUnit(0, {usable_for_learning:false, requires_manual_review:true,
+      review_reasons:['uncertain_geometry'], source:{sha256:sha,source_lines:[{page:3,bbox_pdf_pts:[1,2,3,4],text:'original'}]},
+      pipeline_stage:{status:'scanned_ege_preview_not_source_block_verified'}});
+    db.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw});
+    const before = await invoke(refreshExtractorJob,db,{id:jobId});
+    expect(before.linkageReview).toBe(true);
+    expect(before.units[0]).toMatchObject({decision:'review',publish:false,content_text:raw.content_text,source_evidence:{source:raw.source,pipeline_stage:raw.pipeline_stage}});
+    expect(before.units[0].reasons).toContain('uncertain_geometry');
+    await invoke(saveExtractorUnitReview,db,{id:jobId,unit_id:'u0',choice:'keep_original',reviewed_text:null});
+    expect((await invoke(refreshExtractorJob,db,{id:jobId})).units[0].publish).toBe(false);
+    await expect(invoke(publishExtractorJob,db,publishInput)).rejects.toThrow('Неполная привязка');
+    expect(db.tables.extractor_job_units[0].raw).toEqual(raw);
+    expect(db.tables.materials).toHaveLength(0);
   });
   it("preserves a matching legacy import and rejects a conflicting one", async () => {
     const db = memoryDatabase(); const raw = rawUnit(0);

@@ -239,6 +239,11 @@ function JobDetail({ id, subjects, topics, defaultSubject }: { id: string; subje
   return (
     <div className="space-y-3 border-t pt-3">
       {revisionNote}
+      {q.data.linkageReview && <div className="rounded border border-destructive/40 p-3 text-sm">
+        Неполная привязка к исходнику. Кандидаты и их свидетельства сохранены для проверки; публикация всего результата заблокирована до проверки полноты и сопоставления.
+        <details><summary>Контекст обработки</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(q.data.linkageContext, null, 2)}</pre></details>
+        {!!q.data.linkageEvidence && <details><summary>Сохранённые свидетельства обработки</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(q.data.linkageEvidence, null, 2)}</pre></details>}
+      </div>}
       <p className="text-sm">Блоков: {units.length} · уверенных: {units.filter((u) => u.decision === "confident").length} · требуют решения: {review.length} · только для учителя (не публикуются): {units.filter((u) => u.decision === "private").length} · некорректных: {units.filter((u) => u.decision === "invalid").length} · к публикации: {toPublish}. Задания с автопроверкой не создаются: экстрактор не даёт проверенных ответов.</p>
       {review.length > 0 && <h3 className="text-sm font-semibold">Требуют решения</h3>}
       {units.filter((u) => u.decision === "review" || u.decision === "invalid").map((u) => (
@@ -447,6 +452,7 @@ function PublishedTopicLinker({ jobId, topics }: {
 }
 
 type ReviewUnit = { unit_id: string; title: string; pages: number[]; reasons: string[]; content_text: string; reviewed_text: string | null; review_choice: string | null; reviewed_at: string | null; state: string;
+  source_evidence?: unknown;
   original_content_text?: string | null; machine_patch_count?: number; material_id?: string | null;
   machine_changes?: { before: string; after: string; page: number | null; reason: string; source_verified: boolean }[] };
 
@@ -500,6 +506,7 @@ function UnitReview({ jobId, unit, isRevision, canApplyRevision, onSaved }: {
         </div>
       </div>
       <ul className="text-xs text-destructive list-disc pl-4">{unit.reasons.map((r) => <li key={r}>{r}</li>)}</ul>
+      {!!unit.source_evidence && <details className="rounded border p-2 text-xs"><summary>Доступные сведения об источнике и привязке</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap">{JSON.stringify(unit.source_evidence, null, 2)}</pre></details>}
       {isRevision && !unit.material_id && <p className="text-xs text-muted-foreground">У этого блока нет соответствующего опубликованного материала исходной версии. Автоматическая замена не выполняется.</p>}
       {isRevision && unit.machine_patch_count && <>
         <p className="text-xs text-muted-foreground">Слева сохранён исходный OCR, справа — машинное предложение. Перед применением сверьте его с печатной страницей.</p>

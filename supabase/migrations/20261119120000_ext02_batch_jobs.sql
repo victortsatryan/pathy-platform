@@ -42,10 +42,11 @@ BEGIN
    RAISE EXCEPTION 'Conflicting completed result';
  END IF;
  IF NOT FOUND OR j.status<>'processing' OR j.batch_run_id IS DISTINCT FROM p_run OR j.batch_lease_until IS NULL OR j.batch_lease_until<=now() THEN RAISE EXCEPTION 'Invalid or expired lease'; END IF;
- IF p_result IS NULL OR jsonb_typeof(p_result)<>'object' OR octet_length(p_result::text)>16000000 OR p_result->>'format' IS DISTINCT FROM 'pathy-extraction-result-v1' OR p_result#>>'{source,sha256}' IS DISTINCT FROM j.file_sha256 OR jsonb_typeof(p_result->'units') IS DISTINCT FROM 'array' THEN RAISE EXCEPTION 'Invalid result'; END IF;
- IF p_result#>>'{pipeline_context,source_sha256}' IS DISTINCT FROM j.file_sha256 OR p_result#>'{pipeline_context,source_original_bytes_verified}' IS DISTINCT FROM 'true'::jsonb OR (p_result#>'{pipeline_context,source_block_linkage_complete}' IS DISTINCT FROM 'true'::jsonb AND NOT (j.batch_run_id='manual' AND p_result#>>'{pipeline_context,mode}' IS NOT DISTINCT FROM 'manual_audit' AND p_result#>'{pipeline_context,source_block_linkage_complete}' IS NOT DISTINCT FROM 'false'::jsonb)) THEN RAISE EXCEPTION 'Incomplete provenance'; END IF;
+ IF p_result IS NULL OR jsonb_typeof(p_result)<>'object' OR octet_length(p_result::text)>16000000 OR p_result->>'format' IS DISTINCT FROM 'pathy-extraction-result-v1' OR p_result#>>'{source,sha256}' IS DISTINCT FROM j.file_sha256 OR jsonb_typeof(p_result->'units') IS DISTINCT FROM 'array' THEN RAISE EXCEPTION 'Invalid result' USING ERRCODE = '22000'; END IF;
+ IF p_result#>>'{pipeline_context,source_sha256}' IS DISTINCT FROM j.file_sha256 OR p_result#>'{pipeline_context,source_original_bytes_verified}' IS DISTINCT FROM 'true'::jsonb OR jsonb_typeof(p_result#>'{pipeline_context,source_block_linkage_complete}') IS DISTINCT FROM 'boolean' THEN RAISE EXCEPTION 'Invalid provenance' USING ERRCODE = '22000'; END IF;
+ IF j.batch_run_id <> 'manual' AND p_result#>>'{pipeline_context,mode}' = 'manual_audit' THEN RAISE EXCEPTION 'Invalid provenance mode' USING ERRCODE = '22000'; END IF;
  n:=jsonb_array_length(p_result->'units');
- IF n<1 OR n>5000 OR (p_result#>>'{summary,total_units}')::integer IS DISTINCT FROM n THEN RAISE EXCEPTION 'Incomplete result'; END IF;
+ IF n<1 OR n>5000 OR (p_result#>>'{summary,total_units}')::integer IS DISTINCT FROM n THEN RAISE EXCEPTION 'Incomplete result' USING ERRCODE = '22000'; END IF;
  SELECT count(DISTINCT x->>'unit_id') INTO distinct_n FROM jsonb_array_elements(p_result->'units') x;
  IF distinct_n<>n OR EXISTS (SELECT 1 FROM jsonb_array_elements(p_result->'units') x
     WHERE jsonb_typeof(x)<>'object' OR coalesce(x->>'unit_id','') NOT LIKE 'source:'||j.file_sha256||':unit:%'
@@ -54,24 +55,25 @@ BEGIN
        OR x->'usable_for_grading' IS DISTINCT FROM 'false'::jsonb
        OR (x->>'role'='teacher_private' AND x->'usable_for_learning' IS DISTINCT FROM 'false'::jsonb)
        OR (j.batch_run_id='manual' AND (x->'usable_for_learning' IS DISTINCT FROM 'false'::jsonb OR x->'requires_manual_review' IS DISTINCT FROM 'true'::jsonb OR x#>>'{source,intake_mode}' IS DISTINCT FROM 'manual_audit'))
-       OR (x->'requires_manual_review'='true'::jsonb AND x->'usable_for_learning'='true'::jsonb)) THEN RAISE EXCEPTION 'Invalid unit'; END IF;
+       OR (x->'requires_manual_review'='true'::jsonb AND x->'usable_for_learning'='true'::jsonb)) THEN RAISE EXCEPTION 'Invalid unit' USING ERRCODE = '22000'; END IF;
  IF j.result IS NOT NULL OR EXISTS (SELECT 1 FROM public.extractor_job_units WHERE job_id=p_job) THEN RAISE EXCEPTION 'Existing result requires review'; END IF;
  INSERT INTO public.extractor_job_units(job_id,unit_id,position,raw)
    SELECT p_job,x->>'unit_id',(ord-1)::integer,x FROM jsonb_array_elements(p_result->'units') WITH ORDINALITY a(x,ord);
- UPDATE public.extractor_jobs SET status='succeeded',stage='completed',progress=100,result=p_result,result_total_units=n,result_summary=p_result->'summary',batch_lease_until=NULL,error=NULL,updated_at=now() WHERE id=p_job;
+ UPDATE public.extractor_jobs SET status='succeeded',stage=CASE WHEN j.batch_run_id <> 'manual' AND p_result#>'{pipeline_context,source_block_linkage_complete}'='false'::jsonb THEN 'review_required' ELSE 'completed' END,progress=100,result=p_result,result_total_units=n,result_summary=p_result->'summary',batch_lease_until=NULL,error=NULL,updated_at=now() WHERE id=p_job;
 END $$;
 
 REVOKE ALL ON FUNCTION public.ext02_reserve_job(uuid,uuid,text,uuid),public.ext02_claim_job(uuid,text,text),public.ext02_complete_job(uuid,text,jsonb) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION public.ext02_reserve_job(uuid,uuid,text,uuid),public.ext02_claim_job(uuid,text,text),public.ext02_complete_job(uuid,text,jsonb) TO service_role;
-CREATE OR REPLACE FUNCTION public.ext02_fail_job(p_job uuid,p_run text)
+CREATE OR REPLACE FUNCTION public.ext02_fail_job(p_job uuid,p_run text,p_kind text DEFAULT 'technical')
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 BEGIN
- UPDATE public.extractor_jobs SET status='failed',stage='failed',error='Пакетная обработка завершилась ошибкой',batch_lease_until=NULL,updated_at=now()
+ IF p_kind IS NULL OR p_kind NOT IN ('technical','integrity') THEN RAISE EXCEPTION 'Invalid failure kind'; END IF;
+ UPDATE public.extractor_jobs SET status='failed',stage=CASE WHEN p_kind='integrity' THEN 'integrity_error' ELSE 'failed' END,error=CASE WHEN p_kind='integrity' THEN 'Не пройдена проверка целостности источника или результата' ELSE 'Пакетная обработка завершилась технической ошибкой' END,batch_lease_until=NULL,updated_at=now()
  WHERE id=p_job AND status='processing' AND batch_run_id=p_run AND batch_lease_until>now();
  IF NOT FOUND THEN RAISE EXCEPTION 'Invalid or expired lease'; END IF;
 END $$;
-REVOKE ALL ON FUNCTION public.ext02_fail_job(uuid,text) FROM PUBLIC,anon,authenticated;
-GRANT EXECUTE ON FUNCTION public.ext02_fail_job(uuid,text) TO service_role;
+REVOKE ALL ON FUNCTION public.ext02_fail_job(uuid,text,text) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION public.ext02_fail_job(uuid,text,text) TO service_role;
 CREATE OR REPLACE FUNCTION public.ext02_expire_job(p_job uuid,p_user uuid)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 BEGIN

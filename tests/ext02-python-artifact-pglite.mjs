@@ -22,12 +22,31 @@ await db.query('INSERT INTO public.extractor_jobs(id,file_sha256,file_name,size_
 await db.exec('SET ROLE service_role');
 await db.query('SELECT public.ext02_reserve_job($1,$2,$3,$4)',[job,user,code,approval]);
 await db.query('SELECT public.ext02_claim_job($1,$2,$3)',[job,'1',code]);
+if (result.pipeline_context.source_block_linkage_complete === false) {
+  const wrong={...result, pipeline_context:{...result.pipeline_context,source_original_bytes_verified:false}};
+  await assert.rejects(db.query('SELECT public.ext02_complete_job($1,$2,$3::jsonb)',[job,'1',JSON.stringify(wrong)]),/Invalid provenance/);
+  const grading={...result,units:result.units.map((u,i)=>i ? u : {...u,usable_for_grading:true})};
+  await assert.rejects(db.query('SELECT public.ext02_complete_job($1,$2,$3::jsonb)',[job,'1',JSON.stringify(grading)]),/Invalid unit/);
+  const spoof={...result,pipeline_context:{...result.pipeline_context,mode:'manual_audit'}};
+  await assert.rejects(db.query('SELECT public.ext02_complete_job($1,$2,$3::jsonb)',[job,'1',JSON.stringify(spoof)]),/Invalid provenance mode/);
+}
 await db.query('SELECT public.ext02_complete_job($1,$2,$3::jsonb)',[job,'1',JSON.stringify(result)]);
 const rows=await db.query('SELECT unit_id,raw FROM public.extractor_job_units WHERE job_id=$1 ORDER BY position',[job]);
 assert.equal(rows.rows.length,result.units.length);
 assert.deepEqual(rows.rows.map(x=>x.raw),result.units);
-assert.equal((await db.query('SELECT status FROM public.extractor_jobs WHERE id=$1',[job])).rows[0].status,'succeeded');
+const saved=(await db.query('SELECT status,stage,result FROM public.extractor_jobs WHERE id=$1',[job])).rows[0];
+assert.equal(saved.status,'succeeded');
+assert.equal(saved.stage,result.pipeline_context.source_block_linkage_complete ? 'completed' : 'review_required');
+assert.deepEqual(saved.result,result);
 await db.query('SELECT public.ext02_complete_job($1,$2,$3::jsonb)',[job,'1',JSON.stringify(result)]);
 assert.equal((await db.query('SELECT count(*)::int AS n FROM public.extractor_job_units WHERE job_id=$1',[job])).rows[0].n,result.units.length);
-console.log('Actual Python result accepted unchanged by the platform transaction; retry preserved units');
+const failureJob='10000000-0000-0000-0000-000000000002', failureApproval='20000000-0000-4000-8000-000000000002';
+await db.exec('RESET ROLE');
+await db.query('INSERT INTO public.extractor_jobs(id,file_sha256,file_name,size_bytes,storage_path,status) VALUES($1,$2,$3,$4,$5,$6)',[failureJob,source,'sample.txt',1,`${source}/sample.txt`,'uploaded']);
+await db.exec('SET ROLE service_role');
+await db.query('SELECT public.ext02_reserve_job($1,$2,$3,$4)',[failureJob,user,code,failureApproval]);
+await db.query('SELECT public.ext02_claim_job($1,$2,$3)',[failureJob,'2',code]);
+await db.query('SELECT public.ext02_fail_job($1,$2,$3)',[failureJob,'2','integrity']);
+assert.equal((await db.query('SELECT stage FROM public.extractor_jobs WHERE id=$1',[failureJob])).rows[0].stage,'integrity_error');
+console.log('Python adapter result accepted unchanged by the platform transaction; retry preserved units and review evidence');
 await db.close();

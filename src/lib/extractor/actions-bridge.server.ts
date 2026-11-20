@@ -34,13 +34,21 @@ export async function batchBridge(request: Request): Promise<Response> {
     }
     if (body.action === "complete") {
       const expected = request.headers.get("x-pathy-body-sha256") ?? "";
-      if (!/^[0-9a-f]{64}$/.test(expected) || createHash("sha256").update(raw).digest("hex") !== expected) throw new Error("Integrity error");
+      if (!/^[0-9a-f]{64}$/.test(expected) || createHash("sha256").update(raw).digest("hex") !== expected) {
+        await client.rpc("ext02_fail_job", { p_job: job, p_run: run.runId, p_kind: "integrity" });
+        return Response.json({ error: "Result integrity check failed" }, { status: 422, headers: { "Cache-Control": "no-store" } });
+      }
       const result = await client.rpc("ext02_complete_job", { p_job: job, p_run: run.runId, p_result: body.result });
+      if (result.error?.code === "22000") {
+        await client.rpc("ext02_fail_job", { p_job: job, p_run: run.runId, p_kind: "integrity" });
+        return Response.json({ error: "Result integrity check failed" }, { status: 422, headers: { "Cache-Control": "no-store" } });
+      }
       if (result.error) throw new Error("Invalid result or lease");
       return Response.json({ accepted: true });
     }
     if (body.action === "fail") {
-      const result = await client.rpc("ext02_fail_job", { p_job: job, p_run: run.runId });
+      const kind = z.enum(["technical", "integrity"]).parse(body.failure_kind ?? "technical");
+      const result = await client.rpc("ext02_fail_job", { p_job: job, p_run: run.runId, p_kind: kind });
       if (result.error) throw new Error("Invalid lease");
       return Response.json({ accepted: true });
     }

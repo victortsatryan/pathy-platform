@@ -15,10 +15,20 @@ describe('batch bridge',()=>{
   expect(response.status).toBe(200); expect((await response.json()).source_url).toBe('https://example.invalid/signed');
   expect(state.rpc).toHaveBeenCalledWith('ext02_claim_job',{p_job:job,p_run:'42',p_sha:'b'.repeat(40)});
  });
- it('rejects invalid authentication and altered result before any database write',async()=>{
+ it('rejects invalid authentication and records an altered result as an integrity failure',async()=>{
   state.verify.mockRejectedValueOnce(new Error('invalid'));
   expect((await batchBridge(req({action:'claim',job_id:job}))).status).toBe(403); expect(state.rpc).not.toHaveBeenCalled();
-  expect((await batchBridge(req({action:'complete',job_id:job,result:{}},false))).status).toBe(403); expect(state.rpc).not.toHaveBeenCalled();
+  state.rpc.mockResolvedValue({data:null,error:null});
+  expect((await batchBridge(req({action:'complete',job_id:job,result:{}},false))).status).toBe(422);
+  expect(state.rpc).toHaveBeenCalledWith('ext02_fail_job',{p_job:job,p_run:'42',p_kind:'integrity'});
+ });
+ it('records a validated database integrity rejection without misclassifying a lease error',async()=>{
+  state.rpc.mockResolvedValueOnce({error:{code:'22000'}}).mockResolvedValueOnce({error:null});
+  expect((await batchBridge(req({action:'complete',job_id:job,result:{}}))).status).toBe(422);
+  expect(state.rpc).toHaveBeenLastCalledWith('ext02_fail_job',{p_job:job,p_run:'42',p_kind:'integrity'});
+  state.rpc.mockReset().mockResolvedValue({error:{code:'P0001'}});
+  expect((await batchBridge(req({action:'complete',job_id:job,result:{}}))).status).toBe(403);
+  expect(state.rpc).toHaveBeenCalledTimes(1);
  });
  it('passes authenticated results to the atomic RPC',async()=>{
   state.rpc.mockResolvedValue({data:null,error:null});

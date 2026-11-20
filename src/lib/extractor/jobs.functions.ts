@@ -35,6 +35,11 @@ async function loadJob(sb: Sb, id: string) {
   return r.data;
 }
 
+function needsSourceLinkageReview(job: Awaited<ReturnType<typeof loadJob>>) {
+  const context = (job.result as any)?.pipeline_context;
+  return job.worker_rule_version === "pathy-batch-v1" && (job.stage === "review_required" || (context?.mode !== "manual_audit" && context?.source_block_linkage_complete !== true));
+}
+
 async function update(sb: Sb, id: string, patch: Database["public"]["Tables"]["extractor_jobs"]["Update"]) {
   const r = await supabaseAdmin.from("extractor_jobs").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", id);
   if (r.error) throw new Error(r.error.message);
@@ -185,6 +190,7 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
       if (expired.error) throw new Error("Не удалось проверить срок обработки");
     }
     const fresh = await loadJob(sb, data.id);
+    const linkageReview = needsSourceLinkageReview(fresh);
     const decisions = (fresh.unit_decisions ?? {}) as Record<string, "accept" | "reject">;
     const rows = await sb.from("extractor_job_units").select("unit_id,raw,publish_state,reviewed_text,review_choice,reviewed_by,reviewed_at").eq("job_id", fresh.id).order("position").limit(5000);
     if (rows.error) throw new Error(rows.error.message);
@@ -206,10 +212,11 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
       const raw = r.raw as Record<string, any>;
       const c = classifyUnit(raw?.source?.intake_mode === "manual_audit" ? { ...raw, usable_for_learning: true } : raw, fresh.author);
       const machine = fresh.revision > 1 && !!raw.machine_correction && c.decision !== "private" && c.decision !== "invalid";
-      const currentDecision = machine || (fresh.worker_rule_version === "pathy-batch-v1" && c.decision === "confident") ? "review" as const : c.decision;
+      const currentDecision = machine || (fresh.worker_rule_version === "pathy-batch-v1" && c.decision === "confident") || (linkageReview && c.role === "student_material" && !!c.content_text) ? "review" as const : c.decision;
       const originalText = machine && typeof raw.original_presentation_text === "string" ? raw.original_presentation_text : null;
       return { unit_id: c.unit_id, title: c.title, kind: c.kind, pages: c.pages, role: c.role,
-        decision: currentDecision, reasons: machine ? [...c.reasons, "Машинная коррекция — сверить с оригиналом"] : c.reasons,
+        decision: currentDecision, reasons: [...c.reasons, ...(machine ? ["Машинная коррекция — сверить с оригиналом"] : []), ...(linkageReview ? ["Неполная привязка к исходнику: требуется проверка полноты и сопоставления"] : []), ...(linkageReview && Array.isArray(raw.review_reasons) ? raw.review_reasons.map(String) : [])],
+        source_evidence: linkageReview && c.role === "student_material" ? { source: raw.source, pipeline_stage: raw.pipeline_stage } : null,
         // Full text for review, including previously 'confident' machine edits.
         content_text: currentDecision === "confident" ? "" : c.content_text,
         original_content_text: originalText,
@@ -225,11 +232,11 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
         material_id: fresh.revision > 1 ? rootMaterialByUnit.get(c.unit_id) ?? null : null,
         reviewed_text: r.reviewed_text, review_choice: r.review_choice, reviewed_at: r.reviewed_at,
         admin: decisions[c.unit_id] ?? null,
-        publish: fresh.revision > 1 ? false : (fresh.worker_rule_version !== "pathy-batch-v1" || (!!r.reviewed_by && !!r.reviewed_at && ["keep_original", "accept_corrected"].includes(r.review_choice ?? ""))) && effectivePublication(c, r.review_choice as any, r.reviewed_text, decisions[c.unit_id]).publish,
+        publish: fresh.revision > 1 || linkageReview ? false : (fresh.worker_rule_version !== "pathy-batch-v1" || (!!r.reviewed_by && !!r.reviewed_at && ["keep_original", "accept_corrected"].includes(r.review_choice ?? ""))) && effectivePublication(c, r.review_choice as any, r.reviewed_text, decisions[c.unit_id]).publish,
         state: r.publish_state };
     });
     const { result: _r, ...meta } = fresh;
-    return { job: meta, units, workerConfigured: false };
+    return { job: meta, units, workerConfigured: false, linkageReview, linkageContext: linkageReview ? (fresh.result as any)?.pipeline_context : null, linkageEvidence: linkageReview ? (fresh.result as any)?.review_evidence : null };
   });
 
 export const setExtractorUnitDecision = createServerFn({ method: "POST" }).middleware([requireSupabaseAuth])
@@ -301,6 +308,7 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
       if (!t.data || t.data.subject_id !== data.subject_id) throw new Error("Выбранная тема не найдена или не относится к предмету — публикация остановлена");
     }
     const job = await loadJob(sb, data.id);
+    if (needsSourceLinkageReview(job)) throw new Error("Неполная привязка к исходнику: публикация заблокирована до проверки полноты и сопоставления");
     if (!canPublishRevision(job.revision)) throw new Error("Повторная обработка (версия " + job.revision + ") не публикуется: нужен отдельный аудит и явное решение о замене");
     if (!["succeeded", "publishing", "published"].includes(job.status)) throw new Error("Результат обработки ещё не получен полностью");
     if (job.worker_rule_version === "pathy-batch-v1" && !topicId) throw new Error("Для публикации нужна утверждённая тема");
