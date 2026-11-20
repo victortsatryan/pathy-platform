@@ -62,8 +62,9 @@ No logs or Actions artifacts contain source/results. Timeout, error and conflict
 fail closed; no automatic dispatch retry is made after an uncertain response.
 
 An automated result with verified source bytes but incomplete source-block
-linkage is saved unchanged with its private stage/preview evidence in the same
-job and unit tables. Its existing job status is `succeeded`, with stage
+linkage is saved with its private stage/preview evidence in private storage;
+the existing job and unit tables hold its metadata and unchanged candidate
+units. Its existing job status is `succeeded`, with stage
 `review_required`: this means extraction completed, not that the source is
 complete or approved. The admin review shows available source coordinates,
 context and reasons; per-unit decisions are retained. Publication of the
@@ -72,8 +73,18 @@ the existing interface has no source-wide completeness attestation. Grading
 remains forbidden. A technical failure and a detected integrity failure use
 the existing `failed` status with distinct stages. An invalid identity, role,
 checksum or grading authorization is never accepted as mere uncertainty.
-The existing 16 MB bridge/result limit also applies to the combined result and
-evidence; exceeding it fails closed rather than silently dropping evidence.
+The result and evidence are kept as one private object in the existing
+`extractor-sources` bucket under a job/run/digest-scoped path. The runner
+receives only a signed upload URL for that object, without a database key; the
+server verifies the full object size, SHA-256, source identity, units and
+relationships before importing bounded batches. The job becomes complete only
+when the complete contiguous unit set is present. Identical batch replay
+preserves review decisions; conflicts are rejected. Administrators can obtain
+a short-lived link to the saved object from the review screen. The object limit
+is 160 MiB and one unit must fit within 1.5 MB; these limits fail closed.
+Confirm the existing bucket's deployed file-size and JSON MIME restrictions,
+signed-upload support, server memory and request timeout before any pilot;
+local mocks do not prove those production settings.
 
 For an existing audit JSON file, the admin first uploads the corresponding
 original file, then selects the matching job by source SHA in the existing

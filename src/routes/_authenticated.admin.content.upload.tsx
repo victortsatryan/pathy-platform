@@ -11,7 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import {
   getExtractorJobs, publishExtractorJob, refreshExtractorJob, registerExtractorUpload,
-  getExtractorSourceLink, getPublishedExtractorMaterials, addPublishedExtractorMaterialTopicLinks,
+  getExtractorSourceLink, getExtractorEvidenceLink, getPublishedExtractorMaterials, addPublishedExtractorMaterialTopicLinks,
   reopenSkippedUnits, reprocessExtractorJob, retryExtractorJob, saveExtractorUnitReview,
   publishApprovedExtractorCorrections,
   setExtractorUnitDecision, setPublishedExtractorMaterialsTopic,
@@ -166,6 +166,7 @@ function JobDetail({ id, subjects, topics, defaultSubject }: { id: string; subje
   const [topic, setTopic] = useState("");
   const qc = useQueryClient();
   const refresh = useServerFn(refreshExtractorJob);
+  const evidenceLink = useServerFn(getExtractorEvidenceLink);
   const decide = useServerFn(setExtractorUnitDecision);
   const publish = useServerFn(publishExtractorJob);
   const autoSectionsAfterPublish = useServerFn(applySourceTopicSections);
@@ -243,6 +244,7 @@ function JobDetail({ id, subjects, topics, defaultSubject }: { id: string; subje
         Неполная привязка к исходнику. Кандидаты и их свидетельства сохранены для проверки; публикация всего результата заблокирована до проверки полноты и сопоставления.
         <details><summary>Контекст обработки</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(q.data.linkageContext, null, 2)}</pre></details>
         {!!q.data.linkageEvidence && <details><summary>Сохранённые свидетельства обработки</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(q.data.linkageEvidence, null, 2)}</pre></details>}
+        {q.data.hasStoredEvidence && <Button size="sm" variant="outline" onClick={async () => { try { const { url } = await evidenceLink({ data: { id } }); window.open(url, "_blank", "noopener,noreferrer"); } catch { toast.error("Не удалось открыть свидетельства"); } }}>Открыть сохранённый результат и свидетельства</Button>}
       </div>}
       <p className="text-sm">Блоков: {units.length} · уверенных: {units.filter((u) => u.decision === "confident").length} · требуют решения: {review.length} · только для учителя (не публикуются): {units.filter((u) => u.decision === "private").length} · некорректных: {units.filter((u) => u.decision === "invalid").length} · к публикации: {toPublish}. Задания с автопроверкой не создаются: экстрактор не даёт проверенных ответов.</p>
       {review.length > 0 && <h3 className="text-sm font-semibold">Требуют решения</h3>}

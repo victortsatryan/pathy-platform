@@ -192,8 +192,13 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
     const fresh = await loadJob(sb, data.id);
     const linkageReview = needsSourceLinkageReview(fresh);
     const decisions = (fresh.unit_decisions ?? {}) as Record<string, "accept" | "reject">;
-    const rows = await sb.from("extractor_job_units").select("unit_id,raw,publish_state,reviewed_text,review_choice,reviewed_by,reviewed_at").eq("job_id", fresh.id).order("position").limit(5000);
-    if (rows.error) throw new Error(rows.error.message);
+    const unitRows: any[] = [];
+    for (let offset = 0; offset < 5000; offset += 500) {
+      const page = await sb.from("extractor_job_units").select("unit_id,raw,publish_state,reviewed_text,review_choice,reviewed_by,reviewed_at").eq("job_id", fresh.id).order("position").range(offset, offset + 499);
+      if (page.error) throw new Error(page.error.message);
+      unitRows.push(...(page.data ?? []));
+      if ((page.data?.length ?? 0) < 500) break;
+    }
     // Reprocess revisions must expose source before/after even when the
     // legacy extractor confidently classified the unit. They never publish
     // without explicit review. Match only materials from the original job.
@@ -208,7 +213,7 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
       if (meta?.unit_id && meta?.source_sha256 === fresh.file_sha256)
         rootMaterialByUnit.set(String(meta.unit_id), m.id);
     }
-    const units = (rows.data ?? []).map((r) => {
+    const units = unitRows.map((r) => {
       const raw = r.raw as Record<string, any>;
       const c = classifyUnit(raw?.source?.intake_mode === "manual_audit" ? { ...raw, usable_for_learning: true } : raw, fresh.author);
       const machine = fresh.revision > 1 && !!raw.machine_correction && c.decision !== "private" && c.decision !== "invalid";
@@ -236,7 +241,7 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
         state: r.publish_state };
     });
     const { result: _r, ...meta } = fresh;
-    return { job: meta, units, workerConfigured: false, linkageReview, linkageContext: linkageReview ? (fresh.result as any)?.pipeline_context : null, linkageEvidence: linkageReview ? (fresh.result as any)?.review_evidence : null };
+    return { job: meta, units, workerConfigured: false, linkageReview, linkageContext: linkageReview ? (fresh.result as any)?.pipeline_context : null, linkageEvidence: linkageReview ? (fresh.result as any)?.review_evidence : null, hasStoredEvidence: !!(fresh.result as any)?.storage?.path };
   });
 
 export const setExtractorUnitDecision = createServerFn({ method: "POST" }).middleware([requireSupabaseAuth])
@@ -288,6 +293,19 @@ export const getExtractorSourceLink = createServerFn({ method: "POST" }).middlew
     if (s.error || !s.data?.signedUrl) throw new Error("Не удалось открыть оригинал: " + (s.error?.message ?? ""));
     const isPdf = /\.pdf$/i.test(job.file_name);
     return { url: s.data.signedUrl + (isPdf && data.page ? `#page=${data.page}` : "") };
+  });
+
+/** Admin-only short-lived access to the private, byte-verified result and evidence. */
+export const getExtractorEvidenceLink = createServerFn({ method: "POST" }).middleware([requireSupabaseAuth])
+  .inputValidator((v: unknown) => z.object({ id: z.string().uuid() }).parse(v))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.userId);
+    const job = await loadJob(context.supabase, data.id);
+    const storage = (job.result as any)?.storage;
+    if (!["succeeded", "publishing", "published"].includes(job.status) || typeof storage?.path !== "string" || !storage.path.startsWith(`ext02-results/${job.id}/`) || !/^[0-9a-f]{64}$/.test(storage.sha256 ?? "") || !storage.path.endsWith(`/${storage.sha256}.json`)) throw new Error("Сохранённые свидетельства недоступны");
+    const link = await supabaseAdmin.storage.from(BUCKET).createSignedUrl(storage.path, 300);
+    if (link.error || !link.data?.signedUrl) throw new Error("Не удалось открыть свидетельства");
+    return { url: link.data.signedUrl };
   });
 
 /** One batch per call; the client repeats until remaining = 0. Idempotent, never updates existing materials/tasks. */

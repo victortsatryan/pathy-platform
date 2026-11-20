@@ -36,11 +36,12 @@ function memoryDatabase(admin = true) {
     rpc: vi.fn(async () => ({ data: admin, error: null })),
     from: (name: string) => {
       const filters: ((r: Row) => boolean)[] = [];
-      let action = "select", payload: any, limit = Infinity, single = false, count = false;
+      let action = "select", payload: any, limit = Infinity, offset = 0, single = false, count = false;
       const q: any = {
         select: (_fields?: string, opts?: Row) => { count = opts?.count === "exact"; return q; },
         eq: (key: string, value: unknown) => { filters.push(r => (key.startsWith("extractor_metadata->>") ? r.extractor_metadata?.[key.split("->>")[1]] : r[key]) === value); return q; },
         order: () => q, limit: (n: number) => { limit = n; return q; },
+        range: (start: number, end: number) => { offset = start; limit = end - start + 1; return q; },
         single: () => { single = true; return q; }, maybeSingle: () => { single = true; return q; },
         update: (value: Row) => { action = "update"; payload = value; return q; },
         insert: (value: Row) => { action = "insert"; payload = value; return q; },
@@ -48,7 +49,7 @@ function memoryDatabase(admin = true) {
         then: (resolve: (r: Row) => unknown) => {
           const rows = tables[name];
           if (!rows) throw new Error(`Unexpected table ${name}`);
-          let found = rows.filter(r => filters.every(f => f(r))).slice(0, limit);
+          let found = rows.filter(r => filters.every(f => f(r))).slice(offset, offset + limit);
           if (action === "update") { writes++; found.forEach(r => Object.assign(r, payload)); }
           if (action === "insert") { writes++; const row = { id: `m${rows.length}`, ...payload }; rows.push(row); found = [row]; }
           if (action === "upsert") {
@@ -159,6 +160,13 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     await expect(invoke(publishExtractorJob,db,publishInput)).rejects.toThrow('Неполная привязка');
     expect(db.tables.extractor_job_units[0].raw).toEqual(raw);
     expect(db.tables.materials).toHaveLength(0);
+  });
+  it("paginates review units beyond the API row limit", async () => {
+    const db=memoryDatabase();
+    db.tables.extractor_job_units=Array.from({length:1001},(_,i)=>({id:`r${i}`,job_id:jobId,unit_id:`u${i}`,publish_state:'pending',raw:rawUnit(i)}));
+    const result=await invoke(refreshExtractorJob,db,{id:jobId});
+    expect(result.units).toHaveLength(1001);
+    expect(result.units[1000].unit_id).toBe('u1000');
   });
   it("preserves a matching legacy import and rejects a conflicting one", async () => {
     const db = memoryDatabase(); const raw = rawUnit(0);

@@ -105,3 +105,65 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION public.ext02_import_audit_result(uuid,uuid,jsonb) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION public.ext02_import_audit_result(uuid,uuid,jsonb) TO service_role;
+
+-- Large results remain in the existing private source bucket. Only the trusted
+-- server calls these functions after verifying the complete object and digest.
+CREATE OR REPLACE FUNCTION public.ext02_begin_large_result(p_job uuid,p_run text,p_meta jsonb)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE j public.extractor_jobs%ROWTYPE; n int;
+BEGIN
+ SELECT * INTO j FROM public.extractor_jobs WHERE id=p_job FOR UPDATE;
+ IF NOT FOUND OR j.batch_run_id IS DISTINCT FROM p_run OR j.status NOT IN ('processing','succeeded','publishing','published') THEN RAISE EXCEPTION 'Invalid lease'; END IF;
+ IF j.result IS NOT NULL THEN
+   IF j.result IS NOT DISTINCT FROM p_meta THEN RETURN; END IF;
+   RAISE EXCEPTION 'Conflicting result';
+ END IF;
+ IF j.status<>'processing' OR j.batch_lease_until IS NULL OR j.batch_lease_until<=now() OR EXISTS(SELECT 1 FROM public.extractor_job_units WHERE job_id=p_job) THEN RAISE EXCEPTION 'Invalid lease or existing units'; END IF;
+ IF p_meta->>'format' IS DISTINCT FROM 'pathy-extraction-result-v1' OR p_meta#>>'{source,sha256}' IS DISTINCT FROM j.file_sha256 OR p_meta#>>'{pipeline_context,source_sha256}' IS DISTINCT FROM j.file_sha256 OR p_meta#>'{pipeline_context,source_original_bytes_verified}' IS DISTINCT FROM 'true'::jsonb OR jsonb_typeof(p_meta#>'{pipeline_context,source_block_linkage_complete}') IS DISTINCT FROM 'boolean' OR p_meta#>>'{pipeline_context,mode}'='manual_audit' OR coalesce(p_meta#>>'{storage,sha256}','') !~ '^[0-9a-f]{64}$' OR p_meta#>>'{storage,path}' IS DISTINCT FROM ('ext02-results/'||p_job::text||'/'||p_run||'/'||(p_meta#>>'{storage,sha256}')||'.json') THEN RAISE EXCEPTION 'Invalid result metadata' USING ERRCODE='22000'; END IF;
+ n:=(p_meta#>>'{summary,total_units}')::int;
+ IF n IS NULL OR n<1 OR n>5000 OR p_meta#>>'{storage,size}' IS NULL OR (p_meta#>>'{storage,size}')::bigint NOT BETWEEN 1 AND 167772160 THEN RAISE EXCEPTION 'Invalid result size' USING ERRCODE='22000'; END IF;
+ UPDATE public.extractor_jobs SET result=p_meta,result_total_units=n,result_summary=p_meta->'summary',stage='receiving_result',updated_at=now() WHERE id=p_job;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.ext02_append_large_result(p_job uuid,p_run text,p_offset int,p_units jsonb)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE j public.extractor_jobs%ROWTYPE; n int; existing_n int;
+BEGIN
+ SELECT * INTO j FROM public.extractor_jobs WHERE id=p_job FOR UPDATE;
+ IF NOT FOUND OR j.batch_run_id IS DISTINCT FROM p_run OR j.status NOT IN ('processing','succeeded','publishing','published') OR j.result#>>'{storage,sha256}' IS NULL THEN RAISE EXCEPTION 'Invalid lease'; END IF;
+ IF jsonb_typeof(p_units) IS DISTINCT FROM 'array' OR octet_length(p_units::text)>2000000 THEN RAISE EXCEPTION 'Invalid batch' USING ERRCODE='22000'; END IF;
+ n:=jsonb_array_length(p_units);
+ IF n<1 OR n>100 OR p_offset<0 OR p_offset+n>j.result_total_units THEN RAISE EXCEPTION 'Invalid batch range' USING ERRCODE='22000'; END IF;
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(p_units) x WHERE jsonb_typeof(x)<>'object' OR coalesce(x->>'unit_id','') NOT LIKE 'source:'||j.file_sha256||':unit:%' OR x#>>'{source,sha256}' IS DISTINCT FROM j.file_sha256 OR coalesce(x->>'role','') NOT IN ('student_material','teacher_private') OR x->'usable_for_grading' IS DISTINCT FROM 'false'::jsonb OR (x->>'role'='teacher_private' AND x->'usable_for_learning' IS DISTINCT FROM 'false'::jsonb) OR (x->'requires_manual_review'='true'::jsonb AND x->'usable_for_learning'='true'::jsonb)) THEN RAISE EXCEPTION 'Invalid unit' USING ERRCODE='22000'; END IF;
+ SELECT count(*) INTO existing_n FROM public.extractor_job_units WHERE job_id=p_job;
+ IF p_offset<existing_n THEN
+   IF p_offset+n>existing_n OR EXISTS(SELECT 1 FROM jsonb_array_elements(p_units) WITH ORDINALITY a(x,ord) LEFT JOIN public.extractor_job_units u ON u.job_id=p_job AND u.position=p_offset+ord-1 WHERE u.id IS NULL OR u.unit_id IS DISTINCT FROM x->>'unit_id' OR u.raw IS DISTINCT FROM x) THEN RAISE EXCEPTION 'Conflicting batch'; END IF;
+   RETURN;
+ END IF;
+ IF j.status<>'processing' OR j.batch_lease_until IS NULL OR j.batch_lease_until<=now() OR p_offset<>existing_n THEN RAISE EXCEPTION 'Invalid batch order or lease'; END IF;
+ INSERT INTO public.extractor_job_units(job_id,unit_id,position,raw) SELECT p_job,x->>'unit_id',p_offset+ord-1,x FROM jsonb_array_elements(p_units) WITH ORDINALITY a(x,ord);
+END $$;
+
+CREATE OR REPLACE FUNCTION public.ext02_finish_large_result(p_job uuid,p_run text,p_digest text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE j public.extractor_jobs%ROWTYPE; n int; lo int; hi int; distinct_positions int;
+BEGIN
+ SELECT * INTO j FROM public.extractor_jobs WHERE id=p_job FOR UPDATE;
+ IF NOT FOUND OR j.batch_run_id IS DISTINCT FROM p_run OR j.result#>>'{storage,sha256}' IS DISTINCT FROM p_digest THEN RAISE EXCEPTION 'Invalid result identity'; END IF;
+ IF j.status IN ('succeeded','publishing','published') THEN RETURN; END IF;
+ IF j.status<>'processing' OR j.batch_lease_until IS NULL OR j.batch_lease_until<=now() THEN RAISE EXCEPTION 'Invalid lease'; END IF;
+ SELECT count(*),min(position),max(position),count(DISTINCT position) INTO n,lo,hi,distinct_positions FROM public.extractor_job_units WHERE job_id=p_job;
+ IF n<>j.result_total_units OR lo<>0 OR hi<>n-1 OR distinct_positions<>n THEN RAISE EXCEPTION 'Incomplete result' USING ERRCODE='22000'; END IF;
+ UPDATE public.extractor_jobs SET status='succeeded',stage=CASE WHEN j.result#>'{pipeline_context,source_block_linkage_complete}'='false'::jsonb THEN 'review_required' ELSE 'completed' END,progress=100,batch_lease_until=NULL,error=NULL,updated_at=now() WHERE id=p_job;
+END $$;
+REVOKE ALL ON FUNCTION public.ext02_begin_large_result(uuid,text,jsonb),public.ext02_append_large_result(uuid,text,int,jsonb),public.ext02_finish_large_result(uuid,text,text) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION public.ext02_begin_large_result(uuid,text,jsonb),public.ext02_append_large_result(uuid,text,int,jsonb),public.ext02_finish_large_result(uuid,text,text) TO service_role;
+CREATE OR REPLACE FUNCTION public.ext02_assert_large_job(p_job uuid,p_run text,p_sha text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE j public.extractor_jobs%ROWTYPE;
+BEGIN
+ SELECT * INTO j FROM public.extractor_jobs WHERE id=p_job;
+ IF NOT FOUND OR j.batch_run_id IS DISTINCT FROM p_run OR j.batch_code_sha IS DISTINCT FROM p_sha OR (j.status='processing' AND (j.batch_lease_until IS NULL OR j.batch_lease_until<=now())) OR j.status NOT IN ('processing','succeeded','publishing','published') THEN RAISE EXCEPTION 'Invalid run or lease'; END IF;
+END $$;
+REVOKE ALL ON FUNCTION public.ext02_assert_large_job(uuid,text,text) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION public.ext02_assert_large_job(uuid,text,text) TO service_role;
