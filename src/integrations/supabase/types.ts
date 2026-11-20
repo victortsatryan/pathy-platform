@@ -1226,6 +1226,8 @@ export type Database = {
       extractor_jobs: {
         Row: {
           attempts: number
+          batch_lease_until: string | null
+          batch_storage: Json | null
           author: string | null
           created_at: string
           created_by: string
@@ -1255,6 +1257,8 @@ export type Database = {
         }
         Insert: {
           attempts?: number
+          batch_lease_until?: string | null
+          batch_storage?: Json | null
           author?: string | null
           created_at?: string
           created_by: string
@@ -1284,6 +1288,8 @@ export type Database = {
         }
         Update: {
           attempts?: number
+          batch_lease_until?: string | null
+          batch_storage?: Json | null
           author?: string | null
           created_at?: string
           created_by?: string

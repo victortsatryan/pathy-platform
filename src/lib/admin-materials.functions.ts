@@ -184,6 +184,12 @@ async function processRows(sb: any, userId: string, rawRows: unknown[], dryRun: 
           continue;
         }
         const d = parsed.row;
+        // Validation must not create catalogue records or touch diagnostic
+        // assignments. Counts here represent valid rows, not DB insertions.
+        if (dryRun) {
+          outcome.created++;
+          continue;
+        }
         const subjectId = await upsertSubject(sb, d.subject_title);
         const programId = await upsertProgram(sb, subjectId, d.program_title, d.grade);
         const parentTopicId = d.topic_title
@@ -196,11 +202,6 @@ async function processRows(sb: any, userId: string, rawRows: unknown[], dryRun: 
 
         const num = d.exam_task_number ?? d.order_index ?? i + 1;
         const taskKey = `${slugify(d.diagnostic_title)}-q${num}`;
-
-        if (dryRun) {
-          outcome.created++;
-          continue;
-        }
 
         const testId = await upsertDiagnosticTest(sb, subjectId, programId, d, userId);
         const taskPayload = {
@@ -279,6 +280,10 @@ async function processRows(sb: any, userId: string, rawRows: unknown[], dryRun: 
         continue;
       }
       const row = normalized.row;
+      if (dryRun) {
+        outcome.created++;
+        continue;
+      }
 
       const subjectId = await upsertSubject(sb, row.subject_title);
       const programId = await upsertProgram(sb, subjectId, row.program_title, row.grade);

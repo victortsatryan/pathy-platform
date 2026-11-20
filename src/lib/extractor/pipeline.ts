@@ -1,5 +1,6 @@
-// Pure, client-safe logic for the source-file -> Extractor worker -> Pathy pipeline.
-// HTTP contract: docs/extractor-worker-contract.md (pathy_extractor/worker_service_v06.py).
+// Client-safe source and publication rules. Legacy response parsers below are
+// retained for historical contract validation; the application does not call
+// the retired HTTP worker.
 
 export const SOURCE_EXTENSIONS = ["pdf", "docx", "txt", "md", "xlsx", "csv", "png", "jpg", "jpeg"] as const;
 export const MAX_SOURCE_BYTES = 160 * 1024 * 1024;
@@ -144,7 +145,7 @@ export function canPublishRevision(revision: number | null | undefined): boolean
 
 /** Jobs that already ran to completion (or failed) and may be used to start a new revision. */
 export const REPROCESS_ROOT_STATUSES = ["succeeded", "published"] as const;
-export const IN_FLIGHT_STATUSES = ["uploaded", "queued", "processing", "fetching_result"] as const;
+export const IN_FLIGHT_STATUSES = ["uploaded", "worker_not_configured", "queued", "processing", "fetching_result"] as const;
 
 /** Stable identity across re-runs: source SHA + extractor unit id. */
 export function stableUnitKey(sha: string, unitId: string): string {

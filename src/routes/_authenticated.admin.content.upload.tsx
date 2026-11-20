@@ -11,8 +11,8 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import {
   getExtractorJobs, publishExtractorJob, refreshExtractorJob, registerExtractorUpload,
-  getExtractorSourceLink, getPublishedExtractorMaterials, addPublishedExtractorMaterialTopicLinks,
-  reopenSkippedUnits, reprocessExtractorJob, retryExtractorJob, saveExtractorUnitReview,
+  getExtractorSourceLink, getExtractorEvidenceLink, getPublishedExtractorMaterials, addPublishedExtractorMaterialTopicLinks,
+  reopenSkippedUnits, reprocessExtractorJob, retryExtractorJob, resumeExtractorImport, saveExtractorUnitReview,
   publishApprovedExtractorCorrections,
   setExtractorUnitDecision, setPublishedExtractorMaterialsTopic,
 } from "@/lib/extractor/jobs.functions";
@@ -66,6 +66,8 @@ function UploadPage() {
   const list = useServerFn(getExtractorJobs);
   const register = useServerFn(registerExtractorUpload);
   const retry = useServerFn(retryExtractorJob);
+  const resume = useServerFn(resumeExtractorImport);
+  const [resuming, setResuming] = useState<string | null>(null);
   const reprocess = useServerFn(reprocessExtractorJob);
   const [reprocessing, setReprocessing] = useState<string | null>(null);
   const startReprocess = async (id: string) => {
@@ -113,7 +115,7 @@ function UploadPage() {
         <p className="text-sm text-muted-foreground">PDF, DOCX, TXT, MD, XLSX, CSV, PNG или JPEG до 160 MB. Файл разбирается обработчиком Pathy Content Extractor; уверенные блоки публикуются без ручной проверки, сомнительные — показываются отдельно.</p>
         {data && !data.workerConfigured && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
-            Обработчик не подключён. Файлы сохраняются, но разбор не запускается, пока в настройках проекта не заданы адрес и ключ обработчика.
+            Пакетная обработка ожидает настройки защищённого запуска и подтверждения лимита расходов.
           </div>
         )}
         <div className="grid gap-3 md:grid-cols-3">
@@ -141,12 +143,20 @@ function UploadPage() {
               {j.worker_rule_version && <Badge variant="outline">Корректор: {j.worker_rule_version}</Badge>}
               <span className="text-xs text-muted-foreground">SHA {j.file_sha256.slice(0, 12)} · {(j.size_bytes / 1024).toFixed(0)} KB · автор: {j.author ?? "не указан"}</span>
               <div className="ml-auto flex gap-2">
+                {j.worker_rule_version === "pathy-batch-v1" && ((j.status === "failed" && ["failed", "timeout"].includes(j.stage ?? "")) || (j.status === "processing" && !!j.batch_lease_until && Date.parse(j.batch_lease_until) <= Date.now())) && (
+                  <Button size="sm" variant="outline" disabled={resuming !== null} onClick={async () => {
+                    setResuming(j.id);
+                    try { await resume({ data: { id: j.id } }); toast.success("Импорт продолжен и завершён"); }
+                    catch (e) { toast.error(e instanceof Error ? e.message : "Не удалось продолжить импорт"); }
+                    finally { setResuming(null); qc.invalidateQueries({ queryKey: ["extractor-jobs"] }); qc.invalidateQueries({ queryKey: ["extractor-job", j.id] }); }
+                  }}>{resuming === j.id ? "Продолжение…" : "Продолжить импорт"}</Button>
+                )}
                 {(["succeeded", "published"].includes(j.status) || (j.status === "failed" && j.revision > 1)) && (
                   <Button size="sm" variant="outline" disabled={reprocessing !== null} onClick={() => startReprocess(j.id)}>
                     {reprocessing === j.id ? "Проверка обработчика…" : "Повторно обработать новой версией"}
                   </Button>
                 )}
-                {["failed", "worker_not_configured"].includes(j.status) && (
+                {["failed", "worker_not_configured"].includes(j.status) && !j.batch_storage && !j.result_total_units && (
                   <Button size="sm" variant="outline" onClick={async () => { try { await retry({ data: { id: j.id } }); qc.invalidateQueries({ queryKey: ["extractor-jobs"] }); } catch (e) { toast.error(String(e)); } }}>Повторить</Button>
                 )}
                 <Button size="sm" variant="outline" onClick={() => setOpenId(openId === j.id ? null : j.id)}>{openId === j.id ? "Скрыть" : "Открыть"}</Button>
@@ -166,6 +176,7 @@ function JobDetail({ id, subjects, topics, defaultSubject }: { id: string; subje
   const [topic, setTopic] = useState("");
   const qc = useQueryClient();
   const refresh = useServerFn(refreshExtractorJob);
+  const evidenceLink = useServerFn(getExtractorEvidenceLink);
   const decide = useServerFn(setExtractorUnitDecision);
   const publish = useServerFn(publishExtractorJob);
   const autoSectionsAfterPublish = useServerFn(applySourceTopicSections);
@@ -239,6 +250,12 @@ function JobDetail({ id, subjects, topics, defaultSubject }: { id: string; subje
   return (
     <div className="space-y-3 border-t pt-3">
       {revisionNote}
+      {q.data.linkageReview && <div className="rounded border border-destructive/40 p-3 text-sm">
+        Неполная привязка к исходнику. Кандидаты и их свидетельства сохранены для проверки; публикация всего результата заблокирована до проверки полноты и сопоставления.
+        <details><summary>Контекст обработки</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(q.data.linkageContext, null, 2)}</pre></details>
+        {!!q.data.linkageEvidence && <details><summary>Сохранённые свидетельства обработки</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(q.data.linkageEvidence, null, 2)}</pre></details>}
+        {q.data.hasStoredEvidence && <Button size="sm" variant="outline" onClick={async () => { try { const { url } = await evidenceLink({ data: { id } }); window.open(url, "_blank", "noopener,noreferrer"); } catch { toast.error("Не удалось открыть свидетельства"); } }}>Открыть сохранённый результат и свидетельства</Button>}
+      </div>}
       <p className="text-sm">Блоков: {units.length} · уверенных: {units.filter((u) => u.decision === "confident").length} · требуют решения: {review.length} · только для учителя (не публикуются): {units.filter((u) => u.decision === "private").length} · некорректных: {units.filter((u) => u.decision === "invalid").length} · к публикации: {toPublish}. Задания с автопроверкой не создаются: экстрактор не даёт проверенных ответов.</p>
       {review.length > 0 && <h3 className="text-sm font-semibold">Требуют решения</h3>}
       {units.filter((u) => u.decision === "review" || u.decision === "invalid").map((u) => (
@@ -267,17 +284,17 @@ function JobDetail({ id, subjects, topics, defaultSubject }: { id: string; subje
           <option value="">Предмет</option>{subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
         </select>
         <select aria-label="Тема" className="h-9 max-w-xs rounded-md border bg-background px-2 text-sm" value={topic} disabled={!subject} onChange={(e) => setTopic(e.target.value)}>
-          <option value="">Без темы</option>{topics.filter((t) => t.subject_id === subject).map((t) => <option key={t.id} value={t.id}>{t.title}</option>)}
+          <option value="">{job.worker_rule_version === "pathy-batch-v1" ? "Выберите утверждённую тему" : "Без темы"}</option>{topics.filter((t) => t.subject_id === subject).map((t) => <option key={t.id} value={t.id}>{t.title}</option>)}
         </select>
         <select className="h-9 rounded-md border bg-background px-2 text-sm" value={rights} onChange={(e) => setRights(e.target.value as typeof rights)}>
           <option value="unknown">Права не подтверждены</option><option value="own">Собственный материал</option>
           <option value="licensed">Есть лицензия/разрешение</option><option value="public_domain">Общественное достояние</option>
         </select>
-        <Button disabled={!subject || rights === "unknown" || toPublish === 0 || pub.isPending} onClick={() => pub.mutate()}>
+        <Button disabled={!subject || (job.worker_rule_version === "pathy-batch-v1" && !topic) || rights === "unknown" || toPublish === 0 || pub.isPending} onClick={() => pub.mutate()}>
           {pub.isPending ? `Публикация… ${pubPct ?? ""}` : job.status === "published" ? "Дополнить публикацию" : `Опубликовать для пользователей Pathy (${toPublish})`}
         </Button>
         <span className="text-xs text-muted-foreground">Видно только вошедшим пользователям Pathy. Существующие материалы и задания не изменяются.</span>
-        <p className="w-full text-xs text-muted-foreground">Тема (необязательно) назначается только материалам, публикуемым в этой партии, и только по вашему выбору. Экзаменационные задания, ключи ответов, уроки и события календаря не создаются. Если книга охватывает несколько тем, оставьте «Без темы».</p>
+        <p className="w-full text-xs text-muted-foreground">{job.worker_rule_version === "pathy-batch-v1" ? "Для этой обработки требуется утверждённая тема." : "Тема назначается только по вашему выбору."} Экзаменационные задания и ключи ответов не создаются.</p>
       </div>}
       {job.status === "published" && <SourceTopicSections jobId={id} />}
       {job.status === "published" && <PublishedTopicLinker jobId={id} topics={topics} />}
@@ -447,6 +464,7 @@ function PublishedTopicLinker({ jobId, topics }: {
 }
 
 type ReviewUnit = { unit_id: string; title: string; pages: number[]; reasons: string[]; content_text: string; reviewed_text: string | null; review_choice: string | null; reviewed_at: string | null; state: string;
+  source_evidence?: unknown;
   original_content_text?: string | null; machine_patch_count?: number; material_id?: string | null;
   machine_changes?: { before: string; after: string; page: number | null; reason: string; source_verified: boolean }[] };
 
@@ -500,6 +518,7 @@ function UnitReview({ jobId, unit, isRevision, canApplyRevision, onSaved }: {
         </div>
       </div>
       <ul className="text-xs text-destructive list-disc pl-4">{unit.reasons.map((r) => <li key={r}>{r}</li>)}</ul>
+      {!!unit.source_evidence && <details className="rounded border p-2 text-xs"><summary>Доступные сведения об источнике и привязке</summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap">{JSON.stringify(unit.source_evidence, null, 2)}</pre></details>}
       {isRevision && !unit.material_id && <p className="text-xs text-muted-foreground">У этого блока нет соответствующего опубликованного материала исходной версии. Автоматическая замена не выполняется.</p>}
       {isRevision && unit.machine_patch_count && <>
         <p className="text-xs text-muted-foreground">Слева сохранён исходный OCR, справа — машинное предложение. Перед применением сверьте его с печатной страницей.</p>

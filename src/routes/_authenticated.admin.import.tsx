@@ -397,9 +397,8 @@ function ImportPage() {
               {preview && (
                 <div className="rounded-md border p-4 text-sm space-y-1 bg-muted/50">
                   <div>Всего строк: <strong>{preview.total}</strong></div>
-                  <div>Будет создано: <strong>{preview.created}</strong></div>
-                  <div>Будет обновлено: <strong>{preview.updated}</strong></div>
-                  <div>Будет пропущено: <strong>{preview.skipped}</strong></div>
+                  <div>Валидных строк: <strong>{preview.created}</strong></div>
+                  <div>Совпадения с существующими записями при этой проверке не определяются.</div>
                   <div>Ошибки: <strong>{(preview.errors ?? []).length}</strong></div>
                   {(preview.errors ?? []).length > 0 && (
                     <details className="mt-2" open>
