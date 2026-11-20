@@ -12,7 +12,7 @@ import { Progress } from "@/components/ui/progress";
 import {
   getExtractorJobs, publishExtractorJob, refreshExtractorJob, registerExtractorUpload,
   getExtractorSourceLink, getExtractorEvidenceLink, getPublishedExtractorMaterials, addPublishedExtractorMaterialTopicLinks,
-  reopenSkippedUnits, reprocessExtractorJob, retryExtractorJob, saveExtractorUnitReview,
+  reopenSkippedUnits, reprocessExtractorJob, retryExtractorJob, resumeExtractorImport, saveExtractorUnitReview,
   publishApprovedExtractorCorrections,
   setExtractorUnitDecision, setPublishedExtractorMaterialsTopic,
 } from "@/lib/extractor/jobs.functions";
@@ -66,6 +66,8 @@ function UploadPage() {
   const list = useServerFn(getExtractorJobs);
   const register = useServerFn(registerExtractorUpload);
   const retry = useServerFn(retryExtractorJob);
+  const resume = useServerFn(resumeExtractorImport);
+  const [resuming, setResuming] = useState<string | null>(null);
   const reprocess = useServerFn(reprocessExtractorJob);
   const [reprocessing, setReprocessing] = useState<string | null>(null);
   const startReprocess = async (id: string) => {
@@ -141,12 +143,20 @@ function UploadPage() {
               {j.worker_rule_version && <Badge variant="outline">Корректор: {j.worker_rule_version}</Badge>}
               <span className="text-xs text-muted-foreground">SHA {j.file_sha256.slice(0, 12)} · {(j.size_bytes / 1024).toFixed(0)} KB · автор: {j.author ?? "не указан"}</span>
               <div className="ml-auto flex gap-2">
+                {j.worker_rule_version === "pathy-batch-v1" && ((j.status === "failed" && ["failed", "timeout"].includes(j.stage ?? "")) || (j.status === "processing" && !!j.batch_lease_until && Date.parse(j.batch_lease_until) <= Date.now())) && (
+                  <Button size="sm" variant="outline" disabled={resuming !== null} onClick={async () => {
+                    setResuming(j.id);
+                    try { await resume({ data: { id: j.id } }); toast.success("Импорт продолжен и завершён"); }
+                    catch (e) { toast.error(e instanceof Error ? e.message : "Не удалось продолжить импорт"); }
+                    finally { setResuming(null); qc.invalidateQueries({ queryKey: ["extractor-jobs"] }); qc.invalidateQueries({ queryKey: ["extractor-job", j.id] }); }
+                  }}>{resuming === j.id ? "Продолжение…" : "Продолжить импорт"}</Button>
+                )}
                 {(["succeeded", "published"].includes(j.status) || (j.status === "failed" && j.revision > 1)) && (
                   <Button size="sm" variant="outline" disabled={reprocessing !== null} onClick={() => startReprocess(j.id)}>
                     {reprocessing === j.id ? "Проверка обработчика…" : "Повторно обработать новой версией"}
                   </Button>
                 )}
-                {["failed", "worker_not_configured"].includes(j.status) && (
+                {["failed", "worker_not_configured"].includes(j.status) && !j.batch_storage && !j.result_total_units && (
                   <Button size="sm" variant="outline" onClick={async () => { try { await retry({ data: { id: j.id } }); qc.invalidateQueries({ queryKey: ["extractor-jobs"] }); } catch (e) { toast.error(String(e)); } }}>Повторить</Button>
                 )}
                 <Button size="sm" variant="outline" onClick={() => setOpenId(openId === j.id ? null : j.id)}>{openId === j.id ? "Скрыть" : "Открыть"}</Button>

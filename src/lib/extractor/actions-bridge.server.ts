@@ -41,6 +41,8 @@ export async function batchBridge(request: Request): Promise<Response> {
       if (allowed.error) throw new Error("Invalid run or lease");
       const path = `ext02-results/${job}/${run.runId}/${identity.sha256}.json`;
       if (body.action === "prepare_result") {
+        const recorded = await client.rpc("ext02_register_result_object", { p_job: job, p_run: run.runId, p_sha: identity.sha256, p_size: identity.size });
+        if (recorded.error) throw new Error("Object registration failed");
         const signed = await client.storage.from("extractor-sources").createSignedUploadUrl(path);
         if (signed.error || !signed.data?.signedUrl) throw new Error("Upload unavailable");
         return Response.json({ upload_url: signed.data.signedUrl }, { headers: { "Cache-Control": "no-store" } });

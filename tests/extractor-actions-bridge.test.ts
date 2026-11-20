@@ -41,7 +41,13 @@ describe('batch bridge',()=>{
   const response=await batchBridge(req({action:'prepare_result',job_id:job,object:{sha256:sha,size:41422276}}));
   expect(response.status).toBe(200);
   expect(state.rpc).toHaveBeenCalledWith('ext02_claim_job',{p_job:job,p_run:'42',p_sha:'b'.repeat(40)});
+  expect(state.rpc).toHaveBeenCalledWith('ext02_register_result_object',{p_job:job,p_run:'42',p_sha:sha,p_size:41422276});
   expect(state.upload).toHaveBeenCalledWith(`ext02-results/${job}/42/${sha}.json`);
+ });
+ it('does not issue an upload link when the object identity conflicts',async()=>{
+  state.rpc.mockResolvedValueOnce({error:null}).mockResolvedValueOnce({error:{code:'P0001'}});
+  expect((await batchBridge(req({action:'prepare_result',job_id:job,object:{sha256:sha,size:10}}))).status).toBe(403);
+  expect(state.upload).not.toHaveBeenCalled();
  });
  it('checks run and lease before importing the stored result',async()=>{
   state.rpc.mockResolvedValue({error:null});

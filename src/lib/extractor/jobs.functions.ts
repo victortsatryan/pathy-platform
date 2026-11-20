@@ -10,6 +10,7 @@ import {
 } from "./pipeline";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { dispatchBatch } from "./actions-dispatch.server";
+import { importStoredResult, ResultIntegrityError } from "./actions-large-result.server";
 import { verifySourceResponse } from "./source-verification.server";
 import { canonicalJson } from "./schema";
 import { needsContentReview, topicBelongsToSubject } from "./topic-linking";
@@ -61,7 +62,7 @@ export const getExtractorJobs = createServerFn({ method: "GET" }).middleware([re
   .handler(async ({ context }) => {
     await assertAdmin(context.supabase, context.userId);
     const [jobs, subjects, topics] = await Promise.all([
-      context.supabase.from("extractor_jobs").select("id,file_name,file_sha256,size_bytes,status,stage,progress,error,author,rights_basis,subject_id,created_at,updated_at,publish_report,result_total_units,revision,parent_job_id,worker_rule_version").order("created_at", { ascending: false }).limit(50),
+      context.supabase.from("extractor_jobs").select("id,file_name,file_sha256,size_bytes,status,stage,progress,error,author,rights_basis,subject_id,created_at,updated_at,publish_report,result_total_units,revision,parent_job_id,worker_rule_version,batch_storage,batch_lease_until").order("created_at", { ascending: false }).limit(50),
       context.supabase.from("subjects").select("id,name").eq("is_public", true).order("name"),
       context.supabase.from("topics").select("id,title,subject_id").order("sort_order").limit(2000),
     ]);
@@ -131,7 +132,44 @@ export const retryExtractorJob = createServerFn({ method: "POST" }).middleware([
     await assertAdmin(context.supabase, context.userId);
     const job = await loadJob(context.supabase, data.id);
     if (!["failed", "worker_not_configured", "uploaded"].includes(job.status)) throw new Error("Повтор возможен только после ошибки");
+    if (job.batch_storage || (job.result as any)?.storage) throw new Error("Результат уже сохранён: используйте «Продолжить импорт»");
     await dispatch(context.supabase, data.id, context.userId);
+    return { ok: true };
+  });
+
+/** Resume the already-uploaded result under a new fenced lease; never dispatch Actions. */
+export const resumeExtractorImport = createServerFn({ method: "POST" }).middleware([requireSupabaseAuth])
+  .inputValidator((v: unknown) => z.object({ id: z.string().uuid() }).parse(v))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.userId);
+    const client = supabaseAdmin as any;
+    let claim = await client.rpc("ext02_resume_large_result", { p_job: data.id, p_user: context.userId });
+    // Earlier versions uploaded before recording object metadata. Recover only
+    // one unambiguous object from the original job/run folder, then bind it
+    // under the same row lock and validate its complete bytes in the importer.
+    if (claim.error?.message?.includes("Saved object identity unavailable")) {
+      const job = await loadJob(context.supabase, data.id);
+      const oldRun = (job as any).batch_run_id;
+      if (typeof oldRun !== "string" || !/^[0-9]{1,30}$/.test(oldRun)) throw new Error("Не найден однозначный сохранённый результат");
+      const bucket = client.storage.from(BUCKET);
+      const prefix = `ext02-results/${data.id}/${oldRun}`;
+      const listing = await bucket.list(prefix, { limit: 2 });
+      if (listing.error || !Array.isArray(listing.data) || listing.data.length !== 1 || !/^[0-9a-f]{64}\.json$/.test(listing.data[0]?.name ?? "")) throw new Error("Не найден однозначный сохранённый результат");
+      const name = listing.data[0].name as string;
+      const path = `${prefix}/${name}`;
+      const info = await bucket.info(path);
+      const size = Number(info.data?.size);
+      if (info.error || !Number.isSafeInteger(size) || size < 1 || size > 160 * 1024 * 1024) throw new Error("Не удалось проверить сохранённый результат");
+      claim = await client.rpc("ext02_resume_large_result", { p_job: data.id, p_user: context.userId, p_candidate: { path, sha256: name.slice(0, 64), size } });
+    }
+    if (claim.error || !claim.data) throw new Error("Не удалось продолжить импорт: задание недоступно или уже обрабатывается");
+    const { run, object_run: objectRun, storage } = claim.data;
+    try {
+      await importStoredResult(client, data.id, run, storage.sha256, Number(storage.size), objectRun);
+    } catch (error) {
+      await client.rpc("ext02_fail_job", { p_job: data.id, p_run: run, p_kind: error instanceof ResultIntegrityError ? "integrity" : "technical" });
+      throw new Error(error instanceof ResultIntegrityError ? "Не пройдена проверка целостности сохранённого результата" : "Не удалось продолжить импорт сохранённого результата");
+    }
     return { ok: true };
   });
 

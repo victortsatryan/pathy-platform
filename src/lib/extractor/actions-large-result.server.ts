@@ -5,9 +5,10 @@ const MAX_BATCH_BYTES = 1_500_000;
 export class ResultIntegrityError extends Error {}
 
 /** Verify the complete private object before any units become visible. */
-export async function importStoredResult(client: any, job: string, run: string, sha: string, size: number) {
+export async function importStoredResult(client: any, job: string, run: string, sha: string, size: number, objectRun = run) {
   if (!/^[0-9a-f]{64}$/.test(sha) || !Number.isSafeInteger(size) || size < 1 || size > MAX_BYTES) throw new ResultIntegrityError("Invalid object identity");
-  const path = `ext02-results/${job}/${run}/${sha}.json`;
+  if (!/^[0-9]{1,30}$/.test(objectRun)) throw new ResultIntegrityError("Invalid object run");
+  const path = `ext02-results/${job}/${objectRun}/${sha}.json`;
   const bucket = client.storage.from("extractor-sources");
   const info = await bucket.info(path);
   if (info.error || !info.data) throw new Error("Object unavailable");

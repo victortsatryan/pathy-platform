@@ -3,6 +3,7 @@ ALTER TABLE public.extractor_jobs ADD COLUMN IF NOT EXISTS batch_code_sha text;
 ALTER TABLE public.extractor_jobs ADD COLUMN IF NOT EXISTS batch_run_id text;
 ALTER TABLE public.extractor_jobs ADD COLUMN IF NOT EXISTS batch_approval_id uuid;
 ALTER TABLE public.extractor_jobs ADD COLUMN IF NOT EXISTS batch_lease_until timestamptz;
+ALTER TABLE public.extractor_jobs ADD COLUMN IF NOT EXISTS batch_storage jsonb;
 
 CREATE OR REPLACE FUNCTION public.ext02_reserve_job(p_job uuid,p_user uuid,p_sha text,p_approval uuid)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
@@ -13,7 +14,7 @@ BEGIN
  PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('pathy-ext02-single-run',0));
  IF EXISTS (SELECT 1 FROM public.extractor_jobs WHERE batch_code_sha IS NOT NULL AND batch_lease_until>now() AND status IN ('queued','processing')) THEN RAISE EXCEPTION 'Batch busy'; END IF;
  SELECT * INTO j FROM public.extractor_jobs WHERE id=p_job FOR UPDATE;
- IF NOT FOUND OR j.status NOT IN ('uploaded','worker_not_configured','failed') OR j.attempts>=2 OR j.batch_approval_id=p_approval OR j.result IS NOT NULL OR EXISTS (SELECT 1 FROM public.extractor_job_units WHERE job_id=p_job) THEN RAISE EXCEPTION 'Job is not eligible'; END IF;
+ IF NOT FOUND OR j.status NOT IN ('uploaded','worker_not_configured','failed') OR j.attempts>=2 OR j.batch_approval_id=p_approval OR j.result IS NOT NULL OR j.batch_storage IS NOT NULL OR EXISTS (SELECT 1 FROM public.extractor_job_units WHERE job_id=p_job) THEN RAISE EXCEPTION 'Job is not eligible'; END IF;
  UPDATE public.extractor_jobs SET status='queued',stage='awaiting_batch',worker_rule_version='pathy-batch-v1',batch_code_sha=p_sha,batch_run_id=NULL,batch_approval_id=p_approval,batch_lease_until=now()+interval '20 minutes',error=NULL,updated_at=now() WHERE id=p_job;
 END $$;
 
@@ -119,7 +120,7 @@ BEGIN
    RAISE EXCEPTION 'Conflicting result';
  END IF;
  IF j.status<>'processing' OR j.batch_lease_until IS NULL OR j.batch_lease_until<=now() OR EXISTS(SELECT 1 FROM public.extractor_job_units WHERE job_id=p_job) THEN RAISE EXCEPTION 'Invalid lease or existing units'; END IF;
- IF p_meta->>'format' IS DISTINCT FROM 'pathy-extraction-result-v1' OR p_meta#>>'{source,sha256}' IS DISTINCT FROM j.file_sha256 OR p_meta#>>'{pipeline_context,source_sha256}' IS DISTINCT FROM j.file_sha256 OR p_meta#>'{pipeline_context,source_original_bytes_verified}' IS DISTINCT FROM 'true'::jsonb OR jsonb_typeof(p_meta#>'{pipeline_context,source_block_linkage_complete}') IS DISTINCT FROM 'boolean' OR p_meta#>>'{pipeline_context,mode}'='manual_audit' OR coalesce(p_meta#>>'{storage,sha256}','') !~ '^[0-9a-f]{64}$' OR p_meta#>>'{storage,path}' IS DISTINCT FROM ('ext02-results/'||p_job::text||'/'||p_run||'/'||(p_meta#>>'{storage,sha256}')||'.json') THEN RAISE EXCEPTION 'Invalid result metadata' USING ERRCODE='22000'; END IF;
+ IF p_meta->>'format' IS DISTINCT FROM 'pathy-extraction-result-v1' OR p_meta#>>'{source,sha256}' IS DISTINCT FROM j.file_sha256 OR p_meta#>>'{pipeline_context,source_sha256}' IS DISTINCT FROM j.file_sha256 OR p_meta#>'{pipeline_context,source_original_bytes_verified}' IS DISTINCT FROM 'true'::jsonb OR jsonb_typeof(p_meta#>'{pipeline_context,source_block_linkage_complete}') IS DISTINCT FROM 'boolean' OR p_meta#>>'{pipeline_context,mode}'='manual_audit' OR coalesce(p_meta#>>'{storage,sha256}','') !~ '^[0-9a-f]{64}$' OR (CASE WHEN j.batch_storage IS NOT NULL THEN p_meta->'storage' IS DISTINCT FROM j.batch_storage ELSE p_meta#>>'{storage,path}' IS DISTINCT FROM ('ext02-results/'||p_job::text||'/'||p_run||'/'||(p_meta#>>'{storage,sha256}')||'.json') END) THEN RAISE EXCEPTION 'Invalid result metadata' USING ERRCODE='22000'; END IF;
  n:=(p_meta#>>'{summary,total_units}')::int;
  IF n IS NULL OR n<1 OR n>5000 OR p_meta#>>'{storage,size}' IS NULL OR (p_meta#>>'{storage,size}')::bigint NOT BETWEEN 1 AND 167772160 THEN RAISE EXCEPTION 'Invalid result size' USING ERRCODE='22000'; END IF;
  UPDATE public.extractor_jobs SET result=p_meta,result_total_units=n,result_summary=p_meta->'summary',stage='receiving_result',updated_at=now() WHERE id=p_job;
@@ -167,3 +168,39 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION public.ext02_assert_large_job(uuid,text,text) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION public.ext02_assert_large_job(uuid,text,text) TO service_role;
+
+-- Record the one job-scoped object before issuing a signed upload URL, so a
+-- failure before the first unit still leaves enough identity to resume safely.
+CREATE OR REPLACE FUNCTION public.ext02_register_result_object(p_job uuid,p_run text,p_sha text,p_size bigint)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE j public.extractor_jobs%ROWTYPE; obj jsonb;
+BEGIN
+ IF p_sha IS NULL OR p_sha !~ '^[0-9a-f]{64}$' OR p_size IS NULL OR p_size NOT BETWEEN 1 AND 167772160 OR p_run !~ '^[0-9]{1,30}$' THEN RAISE EXCEPTION 'Invalid object identity'; END IF;
+ SELECT * INTO j FROM public.extractor_jobs WHERE id=p_job FOR UPDATE;
+ IF NOT FOUND OR j.batch_run_id IS DISTINCT FROM p_run OR j.status<>'processing' OR j.batch_lease_until IS NULL OR j.batch_lease_until<=now() THEN RAISE EXCEPTION 'Invalid lease'; END IF;
+ obj:=jsonb_build_object('path','ext02-results/'||p_job::text||'/'||p_run||'/'||p_sha||'.json','sha256',p_sha,'size',p_size);
+ IF (j.batch_storage IS NOT NULL AND j.batch_storage IS DISTINCT FROM obj) OR (j.result IS NOT NULL AND j.result->'storage' IS DISTINCT FROM obj) THEN RAISE EXCEPTION 'Conflicting object'; END IF;
+ UPDATE public.extractor_jobs SET batch_storage=obj,updated_at=now() WHERE id=p_job;
+END $$;
+
+-- A fresh fencing token prevents the expired Actions run and competing admins
+-- from appending after recovery starts. No Actions dispatch is involved.
+CREATE OR REPLACE FUNCTION public.ext02_resume_large_result(p_job uuid,p_user uuid,p_candidate jsonb DEFAULT NULL)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE j public.extractor_jobs%ROWTYPE; obj jsonb; oldrun text; digest text; newrun text;
+BEGIN
+ IF p_user IS NULL OR NOT public.has_role(p_user,'admin'::public.app_role) THEN RAISE EXCEPTION 'Forbidden'; END IF;
+ PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('pathy-ext02-single-run',0));
+ SELECT * INTO j FROM public.extractor_jobs WHERE id=p_job FOR UPDATE;
+ IF NOT FOUND OR j.worker_rule_version IS DISTINCT FROM 'pathy-batch-v1' OR NOT ((j.status='failed' AND j.stage IN ('failed','timeout')) OR (j.status='processing' AND j.batch_lease_until IS NOT NULL AND j.batch_lease_until<=now())) THEN RAISE EXCEPTION 'Result is not eligible for recovery'; END IF;
+ IF EXISTS(SELECT 1 FROM public.extractor_jobs WHERE id<>p_job AND batch_code_sha IS NOT NULL AND batch_lease_until>now() AND status IN ('queued','processing')) THEN RAISE EXCEPTION 'Batch busy'; END IF;
+ obj:=coalesce(j.batch_storage,j.result->'storage',p_candidate);
+ IF obj IS NULL THEN RAISE EXCEPTION 'Saved object identity unavailable'; END IF;
+ digest:=obj->>'sha256'; oldrun:=split_part(obj->>'path','/',3);
+ IF jsonb_typeof(obj) IS DISTINCT FROM 'object' OR coalesce(digest,'') !~ '^[0-9a-f]{64}$' OR oldrun !~ '^[0-9]{1,30}$' OR obj->>'path' IS DISTINCT FROM ('ext02-results/'||p_job::text||'/'||oldrun||'/'||digest||'.json') OR jsonb_typeof(obj->'size') IS DISTINCT FROM 'number' OR (obj->>'size')::numeric NOT BETWEEN 1 AND 167772160 OR trunc((obj->>'size')::numeric)<>(obj->>'size')::numeric OR (j.batch_storage IS NULL AND j.result IS NULL AND oldrun IS DISTINCT FROM j.batch_run_id) OR (j.result IS NOT NULL AND (j.result->'storage' IS DISTINCT FROM obj OR j.result#>>'{source,sha256}' IS DISTINCT FROM j.file_sha256)) THEN RAISE EXCEPTION 'Invalid saved object'; END IF;
+ newrun:='resume:'||gen_random_uuid()::text;
+ UPDATE public.extractor_jobs SET batch_run_id=newrun,batch_storage=obj,batch_lease_until=now()+interval '20 minutes',status='processing',stage='receiving_result',error=NULL,updated_at=now() WHERE id=p_job;
+ RETURN jsonb_build_object('run',newrun,'object_run',oldrun,'storage',obj);
+END $$;
+REVOKE ALL ON FUNCTION public.ext02_register_result_object(uuid,text,text,bigint),public.ext02_resume_large_result(uuid,uuid,jsonb) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION public.ext02_register_result_object(uuid,text,text,bigint),public.ext02_resume_large_result(uuid,uuid,jsonb) TO service_role;

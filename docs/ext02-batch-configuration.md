@@ -86,6 +86,19 @@ Confirm the existing bucket's deployed file-size and JSON MIME restrictions,
 signed-upload support, server memory and request timeout before any pilot;
 local mocks do not prove those production settings.
 
+If a saved-object import fails technically or its lease expires, an admin can
+choose **Продолжить импорт** on the existing job. This does not dispatch
+Actions or run OCR. A new fenced lease excludes the old run and competing
+recovery attempts; the object is re-read and its size and SHA-256 checked
+before the existing batches are replayed and completed. Existing unit rows and
+review decisions are preserved. The object identity is recorded before the
+signed upload URL is issued, including when no batch was saved. If the upload
+never completed, recovery reports a technical error. An integrity failure is
+not eligible for automatic continuation; investigate the saved object first.
+For older jobs interrupted before metadata was recorded, recovery can discover
+one digest-named object in that job's original run folder. Multiple or missing
+objects require investigation; it never guesses which result to use.
+
 For an existing audit JSON file, the admin first uploads the corresponding
 original file, then selects the matching job by source SHA in the existing
 import form. Both former audit entry points use the same job transaction. The
