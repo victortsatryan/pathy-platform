@@ -17,20 +17,55 @@ async function getSourceSections(sb: any, jobId: string) {
   const job = j.data;
   if (job.status !== "published" || !job.subject_id) throw new Error("Сначала завершите публикацию с указанием предмета");
   if (!["own", "licensed", "public_domain"].includes(job.rights_basis)) throw new Error("Права источника не подтверждены");
+  // The job being published does not prove that every row associated with it
+  // was approved, public, or even student-facing. Bind each input material to
+  // its own saved server-side review before deriving publishable sections.
+  const reviewedByMaterial = new Map<string, any[]>();
+  for (let offset = 0; offset < 5000; offset += 500) {
+    const page = await sb.from("extractor_job_units")
+      .select("id,unit_id,material_id,raw,publish_state,review_choice,reviewed_text,reviewed_by,reviewed_at")
+      .eq("job_id", job.id).order("position", { ascending: true }).range(offset, offset + 499);
+    if (page.error) throw new Error(page.error.message);
+    for (const row of page.data ?? []) if (row.material_id) {
+      const prior = reviewedByMaterial.get(row.material_id) ?? [];
+      prior.push(row); reviewedByMaterial.set(row.material_id, prior);
+    }
+    if ((page.data ?? []).length < 500) break;
+  }
   const units: SourceTextUnit[] = [];
+  let blockedSources = 0;
   for (let offset = 0; offset < 5000; offset += 500) {
     const page = await sb.from("materials")
-      .select("id,title,content_text,extractor_metadata")
+      .select("id,title,content_text,status,is_public,extractor_metadata")
       .eq("extractor_metadata->>job_id", job.id)
       .order("created_at", { ascending: true })
       .range(offset, offset + 499);
     if (page.error) throw new Error(page.error.message);
     for (const m of page.data ?? []) {
-      if (!(m.extractor_metadata as Record<string, unknown> | null)?.derived_kind) units.push({ id: m.id, title: m.title, content_text: m.content_text });
+      const meta = (m.extractor_metadata ?? {}) as Record<string, any>;
+      if (meta.derived_kind) continue;
+      const rows = reviewedByMaterial.get(m.id) ?? [];
+      const review = rows.length === 1 ? rows[0] : null;
+      const raw = review?.raw;
+      const text = review?.review_choice === "keep_original" ? raw?.content_text :
+        review?.review_choice === "accept_corrected" ? review?.reviewed_text : null;
+      const status = review?.review_choice === "keep_original" ? "human_approved_original" :
+        review?.review_choice === "accept_corrected" ? "human_corrected" : null;
+      const hasPrivateBlock = Array.isArray(raw?.source?.source_blocks) && raw.source.source_blocks.some((block: any) =>
+        block?.educational_classification_v06?.role === "teacher_private" || block?.source?.private_role === "teacher_private");
+      if (m.status !== "published" || m.is_public !== true || meta.role !== "student_material" ||
+          meta.source_sha256 !== job.file_sha256 || !status || meta.review_status !== status || !review?.reviewed_by || !review?.reviewed_at ||
+          !["published", "existing"].includes(review?.publish_state) ||
+          raw?.role !== "student_material" || hasPrivateBlock || raw?.source?.sha256 !== job.file_sha256 ||
+          raw?.unit_id !== review?.unit_id || meta.unit_id !== review?.unit_id ||
+          typeof text !== "string" || !text.trim() || text.trim() !== (m.content_text ?? "").trim()) {
+        blockedSources++; continue;
+      }
+      units.push({ id: m.id, title: m.title, content_text: m.content_text });
     }
     if ((page.data ?? []).length < 500) break;
   }
-  return { job, sections: parseSourceSections(units) };
+  return { job, sections: parseSourceSections(units), blockedSources };
 }
 
 async function getCurriculumCatalog(sb: any, subjectId: string): Promise<CurriculumMatchTopic[]> {
@@ -53,13 +88,20 @@ async function getCurriculumCatalog(sb: any, subjectId: string): Promise<Curricu
   }));
 }
 
+function sourceHeadingMatches(section: SectionCandidate, catalog: CurriculumMatchTopic[], topicId: string | null): boolean {
+  const printed = section.text.match(/^[$§]\s*\d{1,3}\.[ \t]*([^\n]+)/)?.[1];
+  if (!printed || !topicId) return false;
+  const match = matchCurriculumHeading(printed, catalog);
+  return match.status === "approved_exact" && match.topic_id === topicId;
+}
+
 export const previewSourceTopicSections = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((v: unknown) => z.object({ job_id: z.string().uuid() }).parse(v))
   .handler(async ({ context, data }) => {
     const sb = context.supabase as any;
     await assertAdmin(sb, context.userId);
-    const { job, sections } = await getSourceSections(sb, data.job_id);
+    const { job, sections, blockedSources } = await getSourceSections(sb, data.job_id);
     const catalog = await getCurriculumCatalog(sb, job.subject_id);
     const existingResult = await sb.from("materials").select("extractor_metadata")
       .eq("extractor_metadata->>job_id", data.job_id)
@@ -76,12 +118,12 @@ export const previewSourceTopicSections = createServerFn({ method: "POST" })
         preview: sec.text.slice(0,130), review_reason: sec.review_reason,
         imported: existing.has(sec.number),
         match_status: match.status,
-        topic_id: confident && match.status === "approved_exact" ? match.topic_id : null,
+        topic_id: confident && match.status === "approved_exact" && sourceHeadingMatches(sec, catalog, match.topic_id) ? match.topic_id : null,
         candidate_ids: match.candidate_ids,
       };
     });
     return {
-      total: rows.length,
+      total: rows.length, blocked_sources: blockedSources,
       ready: rows.filter((s) => s.topic_id !== null).length,
       review: rows.filter((s) => s.topic_id === null).length,
       sections: rows,
@@ -95,11 +137,11 @@ export const applySourceTopicSections = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sb = context.supabase as any;
     await assertAdmin(sb, context.userId);
-    const { job, sections } = await getSourceSections(sb, data.job_id);
+    const { job, sections, blockedSources } = await getSourceSections(sb, data.job_id);
     const catalog = await getCurriculumCatalog(sb, job.subject_id);
     const matches = sections.filter((s) => s.confidence === "high").map((s) =>
       ({ section: s, match: matchCurriculumHeading(s.title, catalog) }))
-      .filter((r) => r.match.status === "approved_exact" && !!r.match.topic_id);
+      .filter((r) => r.match.status === "approved_exact" && !!r.match.topic_id && sourceHeadingMatches(r.section, catalog, r.match.topic_id));
     let created_materials = 0, linked = 0, existing = 0;
     const BATCH = 6;
     const pending: typeof matches = [];
@@ -172,6 +214,6 @@ export const applySourceTopicSections = createServerFn({ method: "POST" })
       created_materials, created_topics: 0, linked,
       already_imported: existing,
       remaining: Math.max(0,pending.length-BATCH),
-      manual_review: sections.length-matches.length,
+      manual_review: sections.length-matches.length, blocked_sources: blockedSources,
     };
   });
