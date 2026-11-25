@@ -22,11 +22,12 @@ describe("extractor pipeline", () => {
     expect(resolveAuthor({}, null)).toBeNull();
     expect(classifyUnit(good).author).toBeNull();
   });
-  it("unflagged student units publish without manual review and keep related ids", () => {
+  it("unverified student units require a human decision and keep related ids", () => {
     const u = classifyUnit(good);
-    expect(u.decision).toBe("confident");
+    expect(u.decision).toBe("review");
     expect(u.related_unit_ids).toEqual(["s1"]);
-    expect(shouldPublish(u, undefined)).toBe(true);
+    expect(shouldPublish(u, undefined)).toBe(false);
+    expect(shouldPublish(u, "accept")).toBe(true);
     expect(shouldPublish(u, "reject")).toBe(false);
   });
   it("flagged units need explicit acceptance", () => {
@@ -36,6 +37,14 @@ describe("extractor pipeline", () => {
     expect(shouldPublish(u, undefined)).toBe(false);
     expect(shouldPublish(u, "accept")).toBe(true);
   });
+  it.each(["human_approved_original", "human_corrected", "verified", "unknown", null, undefined])(
+    "never treats imported status %s as editor proof", (review_status) => {
+      const u = classifyUnit({ ...good, review_status });
+      expect(u.decision).toBe("review");
+      expect(effectivePublication(u, null, null).publish).toBe(false);
+      expect(effectivePublication(u, "keep_original", null)).toMatchObject({publish:true, review_status:"human_approved_original"});
+    },
+  );
   it("never publishes teacher_private units, even when accepted", () => {
     const u = classifyUnit({ ...good, role: "teacher_private", answer: "б" });
     expect(u.decision).toBe("private");
@@ -66,8 +75,10 @@ describe("extractor pipeline", () => {
 import { effectivePublication } from "../src/lib/extractor/pipeline";
 describe("built-in review", () => {
   const flagged = classifyUnit({ ...good, requires_manual_review: true, review_reasons: ["ocr"] });
-  it("confident units use untouched raw text without action", () => {
-    expect(effectivePublication(classifyUnit(good), null, "чужой текст")).toEqual({ publish: true, text: "Текст", review_status: "auto_extracted_unverified" });
+  it("unverified units do not publish without action; explicit approval works", () => {
+    const u = classifyUnit(good);
+    expect(effectivePublication(u, null, "чужой текст").publish).toBe(false);
+    expect(effectivePublication(u, "keep_original", null)).toEqual({ publish: true, text: "Текст", review_status: "human_approved_original" });
   });
   it("flagged units do not publish without a human choice", () => {
     expect(effectivePublication(flagged, null, "Исправлено").publish).toBe(false);

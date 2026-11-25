@@ -112,6 +112,9 @@ export function classifyUnit(u: Record<string, any>, jobAuthor?: string | null):
 
   const rr = Array.isArray(u.review_reasons) ? u.review_reasons.map(String) : [];
   if (u.requires_manual_review === true || u.review_status === "needs_review") reasons.push("Экстрактор пометил: нужна проверка");
+  // An imported status is data from the extractor, not an authenticated
+  // editor decision. Publication requires a separate server-side choice.
+  reasons.push("Нужно отдельное сохранённое решение редактора");
   for (const r of rr) reasons.push(r);
   if (!pages.length) reasons.push("Нет страниц источника");
   return { ...base, decision: reasons.length ? "review" : "confident", reasons };
