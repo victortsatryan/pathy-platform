@@ -13,6 +13,24 @@ export function needsContentReview(title: string, contentText: string | null) {
   return text.length < 100 || !title.trim() || /^[^\p{L}\p{N}]+$/u.test(title.trim());
 }
 
+/** A material is source-reviewed only with its unique persisted review row. */
+export function hasReviewedSourceMaterial(m: any, sourceSha: string, rows: readonly any[]): boolean {
+  const meta = m.extractor_metadata ?? {};
+  const review = rows.length === 1 ? rows[0] : null;
+  const raw = review?.raw;
+  const text = review?.review_choice === "keep_original" ? raw?.content_text :
+    review?.review_choice === "accept_corrected" ? review?.reviewed_text : null;
+  const status = review?.review_choice === "keep_original" ? "human_approved_original" :
+    review?.review_choice === "accept_corrected" ? "human_corrected" : null;
+  const hasPrivateBlock = Array.isArray(raw?.source?.source_blocks) && raw.source.source_blocks.some((block: any) =>
+    block?.educational_classification_v06?.role === "teacher_private" || block?.source?.private_role === "teacher_private");
+  return m.status === "published" && m.is_public === true && meta.role === "student_material" &&
+    meta.source_sha256 === sourceSha && !!status && meta.review_status === status && !!review?.reviewed_by && !!review?.reviewed_at &&
+    ["published", "existing"].includes(review?.publish_state) && raw?.role === "student_material" && !hasPrivateBlock &&
+    raw?.source?.sha256 === sourceSha && raw?.unit_id === review?.unit_id && meta.unit_id === review?.unit_id &&
+    typeof text === "string" && !!text.trim() && text.trim() === (m.content_text ?? "").trim();
+}
+
 
 /** Merge legacy primary topic with secondary many-to-many links (UUIDs only). */
 export function materialTopicOrFilter(topicId: string, linkedIds: string[]) {

@@ -13,7 +13,7 @@ import { dispatchBatch } from "./actions-dispatch.server";
 import { importStoredResult, ResultIntegrityError } from "./actions-large-result.server";
 import { verifySourceResponse } from "./source-verification.server";
 import { canonicalJson } from "./schema";
-import { needsContentReview, topicBelongsToSubject } from "./topic-linking";
+import { hasReviewedSourceMaterial, needsContentReview, topicBelongsToSubject } from "./topic-linking";
 import { sourceUnitQuality } from "./source-sections";
 import {
   REVISION_CORRECTION_VERSION, approvedRevisionText, appendCorrectionHistory,
@@ -68,6 +68,23 @@ function lineBoundReviewCandidate(job: Awaited<ReturnType<typeof loadJob>>, raw:
 async function update(sb: Sb, id: string, patch: Database["public"]["Tables"]["extractor_jobs"]["Update"]) {
   const r = await supabaseAdmin.from("extractor_jobs").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", id);
   if (r.error) throw new Error(r.error.message);
+}
+
+async function assertApprovedAssignmentTopic(sb: Sb, topicId: string) {
+  const meta = await (sb as any).from("curriculum_topic_meta").select("topic_id,review_status").eq("topic_id",topicId).maybeSingle();
+  if (meta.error || meta.data?.review_status !== "approved") throw new Error("Тема не утверждена");
+}
+
+async function assertReviewedAssignmentSources(sb: Sb, job: Awaited<ReturnType<typeof loadJob>>, rows: any[]) {
+  if (!canPublishWithRights(job.rights_basis ?? "")) throw new Error("Права источника не подтверждены");
+  const found = await sb.from("extractor_job_units")
+    .select("id,unit_id,material_id,raw,publish_state,review_choice,reviewed_text,reviewed_by,reviewed_at")
+    .eq("job_id",job.id).in("material_id",rows.map((m) => m.id));
+  if (found.error) throw new Error(found.error.message);
+  for (const m of rows) {
+    const matching = (found.data ?? []).filter((row) => row.material_id === m.id);
+    if (!hasReviewedSourceMaterial(m,job.file_sha256,matching)) throw new Error("Материал не имеет однозначного сохранённого редакторского подтверждения источника");
+  }
 }
 
 /** Queue only through the bounded GitHub Actions path. */
@@ -672,9 +689,10 @@ export const setPublishedExtractorMaterialsTopic = createServerFn({ method: "POS
       if (!t.data || !topicBelongsToSubject(job.subject_id, t.data.subject_id)) {
         throw new Error("Тема не найдена или принадлежит другому предмету");
       }
+      await assertApprovedAssignmentTopic(sb,data.topic_id);
     }
     const selected = await sb.from("materials")
-      .select("id,subject_id,topic_id,extractor_metadata,status,is_public")
+      .select("id,subject_id,topic_id,content_text,extractor_metadata,status,is_public")
       .in("id", data.material_ids)
       .eq("extractor_metadata->>job_id", job.id);
     if (selected.error) throw new Error(selected.error.message);
@@ -689,6 +707,9 @@ export const setPublishedExtractorMaterialsTopic = createServerFn({ method: "POS
         throw new Error("Материал не прошёл проверку происхождения, предмета или статуса");
       }
     }
+    // Clearing the primary assignment remains possible; it does not create a
+    // link. Secondary links are deliberately left untouched.
+    if (data.topic_id) await assertReviewedAssignmentSources(sb,job,rows);
     const changed = rows.filter((m) => m.topic_id !== data.topic_id);
     if (!changed.length) return { updated: 0, unchanged: rows.length };
     // Avoid leaving stale links when an existing lesson already uses the material.
@@ -735,8 +756,9 @@ export const addPublishedExtractorMaterialTopicLinks = createServerFn({ method: 
     if (t.error || !t.data || !topicBelongsToSubject(job.subject_id, t.data.subject_id)) {
       throw new Error("Выбранная тема отсутствует или относится к другому предмету");
     }
+    await assertApprovedAssignmentTopic(sb,data.topic_id);
     const source = await sb.from("materials")
-      .select("id,subject_id,topic_id,extractor_metadata,status,is_public")
+      .select("id,subject_id,topic_id,content_text,extractor_metadata,status,is_public")
       .in("id", data.material_ids).eq("extractor_metadata->>job_id", job.id);
     if (source.error) throw new Error(source.error.message);
     if ((source.data ?? []).length !== data.material_ids.length) throw new Error("Есть материалы из другой обработки");
@@ -746,6 +768,7 @@ export const addPublishedExtractorMaterialTopicLinks = createServerFn({ method: 
         throw new Error("Невозможно привязать материал с неподтверждённым происхождением");
       }
     }
+    await assertReviewedAssignmentSources(sb,job,source.data ?? []);
     const links = data.material_ids.map((id) => ({
       material_id: id, topic_id: data.topic_id, link_type: "explains",
       link_source: "explicit_admin", linked_by: context.userId,
@@ -760,11 +783,11 @@ export const addPublishedExtractorMaterialTopicLinks = createServerFn({ method: 
       if (m.topic_id) continue;
       const meta = m.extractor_metadata as Record<string, any>;
       const at = new Date().toISOString();
+      const record = { topic_id: data.topic_id, by: context.userId, at, mode: "explicit_admin_first_topic" };
+      const history = Array.isArray(meta.topic_assignment_history) ? meta.topic_assignment_history : [];
       const update = await sb.from("materials").update({
         topic_id: data.topic_id,
-        extractor_metadata: { ...meta, topic_assignment: {
-          topic_id: data.topic_id, by: context.userId, at, mode: "explicit_admin_first_topic",
-        } } as Json,
+        extractor_metadata: { ...meta, topic_assignment: record, topic_assignment_history: [...history, record] } as Json,
       }).eq("id", m.id).is("topic_id", null).select("id");
       if (update.error) throw new Error(update.error.message);
       firstAssignments += update.data?.length ?? 0;

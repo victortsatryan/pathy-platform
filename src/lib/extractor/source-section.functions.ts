@@ -4,6 +4,7 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { Json } from "@/integrations/supabase/types";
 import { matchCurriculumHeading, type CurriculumMatchTopic } from "@/lib/curriculum/catalog-matcher";
 import { parseSourceSections, type SectionCandidate, type SourceTextUnit } from "./source-sections";
+import { hasReviewedSourceMaterial } from "./topic-linking";
 
 async function assertAdmin(sb: any, userId: string) {
   const result = await sb.rpc("has_role", { _user_id: userId, _role: "admin" });
@@ -45,20 +46,7 @@ async function getSourceSections(sb: any, jobId: string) {
       const meta = (m.extractor_metadata ?? {}) as Record<string, any>;
       if (meta.derived_kind) continue;
       const rows = reviewedByMaterial.get(m.id) ?? [];
-      const review = rows.length === 1 ? rows[0] : null;
-      const raw = review?.raw;
-      const text = review?.review_choice === "keep_original" ? raw?.content_text :
-        review?.review_choice === "accept_corrected" ? review?.reviewed_text : null;
-      const status = review?.review_choice === "keep_original" ? "human_approved_original" :
-        review?.review_choice === "accept_corrected" ? "human_corrected" : null;
-      const hasPrivateBlock = Array.isArray(raw?.source?.source_blocks) && raw.source.source_blocks.some((block: any) =>
-        block?.educational_classification_v06?.role === "teacher_private" || block?.source?.private_role === "teacher_private");
-      if (m.status !== "published" || m.is_public !== true || meta.role !== "student_material" ||
-          meta.source_sha256 !== job.file_sha256 || !status || meta.review_status !== status || !review?.reviewed_by || !review?.reviewed_at ||
-          !["published", "existing"].includes(review?.publish_state) ||
-          raw?.role !== "student_material" || hasPrivateBlock || raw?.source?.sha256 !== job.file_sha256 ||
-          raw?.unit_id !== review?.unit_id || meta.unit_id !== review?.unit_id ||
-          typeof text !== "string" || !text.trim() || text.trim() !== (m.content_text ?? "").trim()) {
+      if (!hasReviewedSourceMaterial(m, job.file_sha256, rows)) {
         blockedSources++; continue;
       }
       units.push({ id: m.id, title: m.title, content_text: m.content_text });
