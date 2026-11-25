@@ -59,6 +59,15 @@ describe('topic assignment requires approved topic and independently reviewed so
     expect(await call(setPublishedExtractorMaterialsTopic,s)).toEqual({updated:0,unchanged:1});expect(s.writes()).toBe(writes);
     expect(s.tables.materials[0].extractor_metadata.topic_assignment_history).toHaveLength(1);
   });
+  it('replays a secondary add without duplicating the link or primary history',async()=>{
+    const s=setup();await call(addPublishedExtractorMaterialTopicLinks,s);
+    const before=structuredClone(s.tables.materials[0].extractor_metadata.topic_assignment_history);
+    await call(addPublishedExtractorMaterialTopicLinks,s);
+    expect(s.tables.material_topic_links).toHaveLength(1);
+    expect(s.tables.materials[0].extractor_metadata.topic_assignment_history).toEqual(before);
+    expect(before).toHaveLength(1);
+    expect(s.tables.materials[0].content_text).toBe(text);
+  });
   it('clearing the primary preserves history and does not silently delete secondary links',async()=>{
     const s=setup();await call(addPublishedExtractorMaterialTopicLinks,s);s.tables.extractor_job_units=[];
     await call(setPublishedExtractorMaterialsTopic,s,null);
