@@ -41,6 +41,30 @@ function needsSourceLinkageReview(job: Awaited<ReturnType<typeof loadJob>>) {
   return job.worker_rule_version === "pathy-batch-v1" && (job.stage === "review_required" || (context?.mode !== "manual_audit" && context?.source_block_linkage_complete !== true));
 }
 
+// A page-less text source can still have exact source-line provenance. This is
+// a review candidate, not permission to publish: publication additionally
+// requires the persisted admin review, rights, approved topic and revision gate.
+// Other reasons for unusability must not be overridden by a generic review.
+function lineBoundReviewCandidate(job: Awaited<ReturnType<typeof loadJob>>, raw: Record<string, any>): boolean {
+  const context = (job.result as any)?.pipeline_context;
+  const ids = raw.source?.canonical_block_ids, blocks = raw.source?.source_blocks;
+  const stage = raw.pipeline_stage;
+  return job.worker_rule_version === "pathy-batch-v1" && !needsSourceLinkageReview(job)
+    && context?.source_original_bytes_verified === true && context?.source_sha256 === job.file_sha256
+    && raw.role === "student_material" && raw.source?.sha256 === job.file_sha256
+    && raw.usable_for_learning === false && raw.requires_manual_review === true
+    && raw.review_status === "needs_review" && Array.isArray(raw.review_reasons)
+    && raw.review_reasons.length === 1 && raw.review_reasons[0] === "source_page_unavailable"
+    && Array.isArray(ids) && ids.length > 0 && ids.every((id: unknown) => typeof id === "string" && !!id.trim()) && new Set(ids).size === ids.length
+    && Array.isArray(blocks) && blocks.length === ids.length
+    && blocks.every((block: any, index: number) => block?.block_id === ids[index]
+      && Number.isSafeInteger(block?.source?.line) && block.source.line > 0)
+    && stage?.status === "source_bound_not_production_verified"
+    && Array.isArray(stage.source_block_ids) && canonicalJson(stage.source_block_ids) === canonicalJson(ids)
+    && Array.isArray(stage.source_locator_statuses) && stage.source_locator_statuses.length === ids.length
+    && stage.source_locator_statuses.every((status: unknown) => status === "exact");
+}
+
 async function update(sb: Sb, id: string, patch: Database["public"]["Tables"]["extractor_jobs"]["Update"]) {
   const r = await supabaseAdmin.from("extractor_jobs").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", id);
   if (r.error) throw new Error(r.error.message);
@@ -253,12 +277,15 @@ export const refreshExtractorJob = createServerFn({ method: "POST" }).middleware
     }
     const units = unitRows.map((r) => {
       const raw = r.raw as Record<string, any>;
-      const c = classifyUnit(raw?.source?.intake_mode === "manual_audit" ? { ...raw, usable_for_learning: true } : raw, fresh.author);
+      const c = classifyUnit(raw?.source?.intake_mode === "manual_audit" || lineBoundReviewCandidate(fresh, raw) ? { ...raw, usable_for_learning: true } : raw, fresh.author);
       const machine = fresh.revision > 1 && !!raw.machine_correction && c.decision !== "private" && c.decision !== "invalid";
-      const currentDecision = machine || (fresh.worker_rule_version === "pathy-batch-v1" && c.decision === "confident") || (linkageReview && c.role === "student_material" && !!c.content_text) ? "review" as const : c.decision;
+      // A review-pending unit can be structurally ineligible for publication
+      // but must still appear in the existing review UI with its explanation.
+      const heldReview = c.decision === "invalid" && c.role === "student_material" && !!c.content_text && raw.requires_manual_review === true;
+      const currentDecision = machine || heldReview || (fresh.worker_rule_version === "pathy-batch-v1" && c.decision === "confident") || (linkageReview && c.role === "student_material" && !!c.content_text) ? "review" as const : c.decision;
       const originalText = machine && typeof raw.original_presentation_text === "string" ? raw.original_presentation_text : null;
       return { unit_id: c.unit_id, title: c.title, kind: c.kind, pages: c.pages, role: c.role,
-        decision: currentDecision, reasons: [...c.reasons, ...(machine ? ["Машинная коррекция — сверить с оригиналом"] : []), ...(linkageReview ? ["Неполная привязка к исходнику: требуется проверка полноты и сопоставления"] : []), ...(linkageReview && Array.isArray(raw.review_reasons) ? raw.review_reasons.map(String) : [])],
+        decision: currentDecision, reasons: [...c.reasons, ...(heldReview ? ["Публикация заблокирована до устранения ограничений исходника или структуры"] : []), ...(machine ? ["Машинная коррекция — сверить с оригиналом"] : []), ...(linkageReview ? ["Неполная привязка к исходнику: требуется проверка полноты и сопоставления"] : []), ...((linkageReview || heldReview) && Array.isArray(raw.review_reasons) ? raw.review_reasons.map(String) : [])],
         source_evidence: linkageReview && c.role === "student_material" ? { source: raw.source, pipeline_stage: raw.pipeline_stage } : null,
         // Full text for review, including previously 'confident' machine edits.
         content_text: currentDecision === "confident" ? "" : c.content_text,
@@ -381,7 +408,8 @@ export const publishExtractorJob = createServerFn({ method: "POST" }).middleware
       const raw = row.raw as Record<string, any>;
       if (raw?.source?.sha256 !== job.file_sha256) throw new Error("SHA блока не совпадает с источником обработки");
       const reviewedAudit = raw?.source?.intake_mode === "manual_audit" && !!row.reviewed_by && !!row.reviewed_at && ["keep_original", "accept_corrected"].includes(row.review_choice ?? "");
-      const u = classifyUnit(reviewedAudit ? { ...raw, usable_for_learning: true } : raw, job.author);
+      const reviewedLineBound = lineBoundReviewCandidate(job, raw) && !!row.reviewed_by && !!row.reviewed_at && ["keep_original", "accept_corrected"].includes(row.review_choice ?? "");
+      const u = classifyUnit(reviewedAudit || reviewedLineBound ? { ...raw, usable_for_learning: true } : raw, job.author);
       const mark = (publish_state: "published" | "existing" | "skipped" | "failed", extra: { material_id?: string; publish_error?: string } = {}) =>
         supabaseAdmin.from("extractor_job_units").update({ publish_state, ...extra }).eq("id", row.id);
       if (job.worker_rule_version === "pathy-batch-v1" && (!row.reviewed_by || !row.reviewed_at || !["keep_original", "accept_corrected"].includes(row.review_choice ?? ""))) {

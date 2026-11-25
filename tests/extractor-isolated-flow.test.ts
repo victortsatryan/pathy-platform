@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 const service = vi.hoisted(() => ({ db: null as any }));
 vi.mock("@/integrations/supabase/client.server", () => ({ supabaseAdmin: new Proxy({}, { get: (_t, key) => service.db[key] }) }));
 
@@ -161,6 +162,55 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     expect(db.tables.extractor_job_units[0].raw).toEqual(raw);
     expect(db.tables.materials).toHaveLength(0);
   });
+  it("allows a line-bound page-less unit only after a saved admin review", async () => {
+    const db = memoryDatabase(), job = db.tables.extractor_jobs[0];
+    job.worker_rule_version = 'pathy-batch-v1';
+    job.result = {pipeline_context:{source_sha256:sha,source_original_bytes_verified:true,source_block_linkage_complete:true}};
+    db.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'approved'}];
+    const raw: Row = rawUnit(0, {pages:[],usable_for_learning:false,requires_manual_review:true,review_status:'needs_review',
+      review_reasons:['source_page_unavailable'],source:{sha256:sha,canonical_block_ids:['block_1'],source_blocks:[{block_id:'block_1',source:{line:1}}]},
+      pipeline_stage:{status:'source_bound_not_production_verified',source_block_ids:['block_1'],source_locator_statuses:['exact']}});
+    db.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw});
+    const before = await invoke(refreshExtractorJob,db,{id:jobId});
+    expect(before.units[0]).toMatchObject({decision:'review',publish:false,content_text:raw.content_text});
+    await invoke(publishExtractorJob,db,{...publishInput,topic_id:topicOwn});
+    expect(db.tables.materials).toHaveLength(0);
+    await invoke(saveExtractorUnitReview,db,{id:jobId,unit_id:'u0',choice:'accept_corrected',reviewed_text:'Editor text'});
+    expect((await invoke(refreshExtractorJob,db,{id:jobId})).units[0].publish).toBe(true);
+    await invoke(publishExtractorJob,db,{...publishInput,topic_id:topicOwn});
+    expect(db.tables.materials).toHaveLength(1);
+    expect(db.tables.materials[0]).toMatchObject({content_text:'Editor text',extractor_metadata:{original_unit:raw,human_correction:{choice:'accept_corrected',by:'isolated-admin'}}});
+    expect(db.tables.extractor_job_units[0].raw).toEqual(raw);
+  });
+  it.skipIf(!process.env.PATHY_EXT02_EGE9_FIXTURE)("routes real saved EGE9 units into review without creating decisions", async () => {
+    const input = JSON.parse(readFileSync(process.env.PATHY_EXT02_EGE9_FIXTURE!, 'utf8'));
+    const db=memoryDatabase(), job=db.tables.extractor_jobs[0];
+    job.file_sha256=input.source.sha256; job.worker_rule_version='pathy-batch-v1'; job.result={pipeline_context:input.pipeline_context};
+    db.tables.extractor_job_units=input.units.map((raw:Row,i:number)=>({id:`r${i}`,job_id:jobId,unit_id:raw.unit_id,raw,publish_state:'pending'}));
+    const result=await invoke(refreshExtractorJob,db,{id:jobId});
+    expect(result.units.filter((u:Row)=>u.role==='student_material' && u.decision==='review')).toHaveLength(20);
+    expect(result.units.filter((u:Row)=>u.decision==='private')).toHaveLength(18);
+    expect(result.units.every((u:Row)=>u.publish===false)).toBe(true);
+    expect(db.writes()).toBe(0);
+  });
+  it.each(['extra_reason','unverified_source','missing_locator','spoofed_choice'])('keeps line-bound review closed for %s', async (caseName) => {
+    const db = memoryDatabase(), job = db.tables.extractor_jobs[0];
+    job.worker_rule_version = 'pathy-batch-v1';
+    job.result = {pipeline_context:{source_sha256:sha,source_original_bytes_verified:true,source_block_linkage_complete:true}};
+    db.tables.curriculum_topic_meta = [{topic_id:topicOwn,review_status:'approved'}];
+    const raw: Row = rawUnit(0, {pages:[],usable_for_learning:false,requires_manual_review:true,review_status:'needs_review',
+      review_reasons:['source_page_unavailable'],source:{sha256:sha,canonical_block_ids:['block_1'],source_blocks:[{block_id:'block_1',source:{line:1}}]},
+      pipeline_stage:{status:'source_bound_not_production_verified',source_block_ids:['block_1'],source_locator_statuses:['exact']}});
+    if(caseName==='extra_reason') raw.review_reasons.push('suspect_ocr_glyph');
+    if(caseName==='unverified_source') job.result.pipeline_context.source_original_bytes_verified=false;
+    if(caseName==='missing_locator') raw.source.source_blocks[0].source.line=0;
+    const row = {id:'r',job_id:jobId,unit_id:'u0',publish_state:'pending',raw};
+    db.tables.extractor_job_units.push(row);
+    if(caseName==='spoofed_choice') Object.assign(row,{review_choice:'keep_original',reviewed_by:null,reviewed_at:null});
+    else await invoke(saveExtractorUnitReview,db,{id:jobId,unit_id:'u0',choice:'keep_original',reviewed_text:null});
+    await invoke(publishExtractorJob,db,{...publishInput,topic_id:topicOwn});
+    expect(db.tables.materials).toHaveLength(0);
+  });
   it("paginates review units beyond the API row limit", async () => {
     const db=memoryDatabase();
     db.tables.extractor_job_units=Array.from({length:1001},(_,i)=>({id:`r${i}`,job_id:jobId,unit_id:`u${i}`,publish_state:'pending',raw:rawUnit(i)}));
@@ -172,6 +222,7 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     const db = memoryDatabase(); const raw = rawUnit(0);
     db.tables.materials.push({id:'old',subject_id:subjectId,extractor_metadata:{unit_id:raw.unit_id,source_sha256:sha,original_unit:raw}});
     db.tables.extractor_job_units.push({id:'r',job_id:jobId,unit_id:raw.unit_id,publish_state:'pending',raw});
+    await invoke(saveExtractorUnitReview, db, {id:jobId,unit_id:raw.unit_id,choice:'keep_original',reviewed_text:null});
     await invoke(publishExtractorJob,db,publishInput);
     expect(db.tables.materials).toHaveLength(1);
     db.tables.extractor_job_units[0].publish_state='pending';
@@ -184,6 +235,9 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
     const db = memoryDatabase();
     const raws = [rawUnit(0), rawUnit(1, { requires_manual_review: true }), rawUnit(2, { role: "teacher_private", content_text: "27. answer" }), ...Array.from({ length: 31 }, (_, i) => rawUnit(i + 3))];
     db.tables.extractor_job_units = raws.map((raw, i) => ({ id: `row${i}`, job_id: jobId, unit_id: raw.unit_id, raw, publish_state: "pending" }));
+    for (const raw of raws.filter(x => x.role === 'student_material' && x.unit_id !== 'u1')) {
+      await invoke(saveExtractorUnitReview, db, {id:jobId,unit_id:raw.unit_id,choice:'keep_original',reviewed_text:null});
+    }
     await invoke(saveExtractorUnitReview, db, { id: jobId, unit_id: "u1", choice: "accept_corrected", reviewed_text: "Human corrected" });
     const first = await invoke(publishExtractorJob, db, publishInput);
     expect(first.remaining).toBe(4);
@@ -223,7 +277,7 @@ describe("isolated actual extractor handlers (mock DB + worker, not LIVE E2E)", 
 describe("explicit admin topic assignment (isolated mock DB)", () => {
   const seed = (db: ReturnType<typeof memoryDatabase>) => {
     const raws = [rawUnit(0), rawUnit(1, { role: "teacher_private", content_text: "27. answer" }), rawUnit(2, { answer: "42", usable_for_grading: true })];
-    db.tables.extractor_job_units = raws.map((raw, i) => ({ id: `row${i}`, job_id: jobId, unit_id: raw.unit_id, raw, publish_state: "pending" }));
+    db.tables.extractor_job_units = raws.map((raw, i) => ({ id: `row${i}`, job_id: jobId, unit_id: raw.unit_id, raw, publish_state: "pending", review_choice:'keep_original', reviewed_by:'isolated-admin', reviewed_at:'2026-01-01' }));
     db.tables.tasks = [];
   };
   it("assigns the chosen topic of the same subject to published materials only", async () => {
